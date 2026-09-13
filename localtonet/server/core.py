@@ -68,6 +68,7 @@ class ServerStats:
     """服务端累计计数。启动至今不清零，给日志与未来的指标接口用。"""
 
     clients_registered: int = 0
+    registrations_rejected: int = 0
     requests_total: int = 0
     requests_failed: int = 0
     bytes_upload: int = 0
@@ -76,6 +77,7 @@ class ServerStats:
     def to_dict(self) -> Dict[str, int]:
         return {
             "clients_registered": self.clients_registered,
+            "registrations_rejected": self.registrations_rejected,
             "requests_total": self.requests_total,
             "requests_failed": self.requests_failed,
             "bytes_upload": self.bytes_upload,
@@ -290,6 +292,7 @@ class TunnelServer:
         """校验并登记客户端。返回 None 表示注册被拒（调用方负责关连接）。"""
         client_id = msg.get("client_id")
         if not isinstance(client_id, str) or not client_id.strip():
+            self._stats.registrations_rejected += 1
             await self._send_raw(
                 writer,
                 make_msg(MsgType.REGISTER_ACK, ok=False, code=400, msg="client_id 必须是非空字符串", claimed=[], conflicts=[]),
@@ -300,24 +303,27 @@ class TunnelServer:
         try:
             local_ports = parse_ports(msg.get("local_ports"))
         except ConfigError as exc:
+            self._stats.registrations_rejected += 1
             await self._send_raw(
                 writer,
-                make_msg(MsgType.REGISTER_ACK, ok=False, code=400, msg=str(exc), claimed=[], conflicts=[]),
+                make_msg(MsgType.REGISTER_ACK, ok=False, code=400, msg=exc.message, claimed=[], conflicts=[]),
             )
             return None
 
         try:
             self._auth.verify(msg, peer)
         except AuthError as exc:
+            self._stats.registrations_rejected += 1
             self._log.warning("拒绝客户端 %s（%s）：%s", client_id, peer, exc)
             await self._send_raw(
                 writer,
-                make_msg(MsgType.REGISTER_ACK, ok=False, code=exc.code, msg=str(exc), claimed=[], conflicts=[]),
+                make_msg(MsgType.REGISTER_ACK, ok=False, code=exc.code, msg=exc.message, claimed=[], conflicts=[]),
             )
             return None
 
         if not self._registry.has(client_id) and self._registry.client_count >= self._config.limits.max_clients:
             reason = f"在线客户端数已达上限 {self._config.limits.max_clients}"
+            self._stats.registrations_rejected += 1
             self._log.warning("拒绝客户端 %s：%s", client_id, reason)
             await self._send_raw(
                 writer,

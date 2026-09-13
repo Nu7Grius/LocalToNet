@@ -519,6 +519,17 @@ def test_build_authenticator_follows_config() -> None:
     assert isinstance(build_authenticator(AuthConfig(enabled=True, token="x")), TokenAuthenticator)
 
 
+def test_tunnel_error_message_carries_no_code_prefix() -> None:
+    """回执 / 日志里的 ``msg`` 不该自带 ``[403]`` —— ``code`` 已经是独立字段了。
+
+    否则客户端把它拼进自己的带前缀异常里，就变成 ``[403] [403] …`` 叠字。
+    """
+    error = AuthError("客户端提供的 token 不合法")
+
+    assert error.message == "客户端提供的 token 不合法"
+    assert str(error) == "[403] 客户端提供的 token 不合法"
+
+
 def test_mapping_rule_roundtrip() -> None:
     rule = MappingRule(public_port=9028, local_port=8000, host="127.0.0.1", remark="demo")
     assert MappingRule.from_dict(rule.to_dict()) == rule

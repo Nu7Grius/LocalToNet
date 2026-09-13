@@ -17,6 +17,7 @@
 - **双保险保活**：客户端心跳探测 + 服务端失联看门狗
 - **指数退避重连**：1s → 2s → 4s → … → 60s 封顶，成功即归零
 - **明确错误语义**：404 / 502 兜底，绝不留下"空回复"
+- **可选共享令牌鉴权**：一行 `--token` 开启；令牌错了立刻停手（403），容量满了继续重试（503）
 - **零运行时依赖**：纯标准库（界面用自带的 tkinter），Python 3.11+（开发环境用 3.13）
 
 ## 架构
@@ -84,6 +85,46 @@ python client.py --server 1.2.3.4:7000 --local-ports 8000,8080 --client-id my-pc
 
 配置优先级：**默认值 < JSON 文件 < 环境变量（`LOCALTONET_` 前缀）< 命令行参数**。
 
+## 开启鉴权
+
+默认 `auth.enabled=false`，开箱即用的本地演示不需要任何令牌。公网部署建议开启**共享令牌**：
+服务端校验客户端在 `register_client` 帧里带的 `token`，不匹配就回 `403` 并拒掉连接。
+
+| 位置 | 方式 | 示例 |
+| --- | --- | --- |
+| 服务端 | 命令行 | `python server.py --token s3cret` |
+| 服务端 | 环境变量 | `LOCALTONET_AUTH_TOKEN=s3cret python server.py` |
+| 服务端 | 配置文件 | `config.json` 的 `"auth": { "enabled": true, "token": "s3cret" }` |
+| 客户端 | 命令行 | `python client.py --server 1.2.3.4:7000 --local-ports 8000 --token s3cret` |
+| 客户端 | 环境变量 | `LOCALTONET_AUTH_TOKEN=s3cret python client.py …` |
+| 客户端 | 配置文件 | `client.json` 的 `"auth_token": "s3cret"` |
+
+`gui.py` 的参数与 `client.py` **完全一致**，`--token` 在界面上同样生效。
+
+> 服务端 `--token` 与客户端 `--token` 填的是**同一个共享密钥**，两端差一个字都连不上。
+> 本地演示临时要关掉配置文件里开着的鉴权，用 `--no-auth` 覆盖即可（命令行优先级最高）。
+> 二者互斥，同时给出会被参数解析拦下并以退出码 `2` 结束。
+
+### 忘了配客户端令牌会怎样
+
+症状很明确，不会含糊成"连不上，原因不明"：
+
+1. 服务端日志出现 `拒绝客户端 test-xxx（127.0.0.1:xxxxx）：客户端 … 提供的 token 不合法`；
+2. 客户端收到 `code=403`，状态直接变 `stopped` 并**停止重试**，
+   日志写 `注册被永久拒绝（[403] …），停止重试`，事件总线发一条 `CONTROL_LOST(fatal=True)`
+   （GUI 的事件日志里能看到）。
+
+这是故意的：凭据不对，重试一万次结果也一样，每 60 秒撞一次墙只会刷满日志、掩盖真正的问题。
+
+| 拒绝原因 | `code` | 客户端行为 |
+| --- | --- | --- |
+| 令牌错误 / 根本没带令牌 | `403` | **永久失败** → 停止重试，状态 `stopped` |
+| 在线客户端数已达 `limits.max_clients` | `503` | **暂时失败** → 继续指数退避重试 |
+| `client_id` 非法 / 端口列表非法 | `400` | 继续退避重试（改配置就能好） |
+
+> ⚠️ 令牌目前是**明文**放在 `register_client` 帧里走 TCP，`client.json` 里也是明文落盘。
+> 公网部署请置于 TLS 终止层（Nginx / Caddy）之后，或按「扩展点」表接入传输加密。
+
 ## 目录结构
 
 ```
@@ -109,7 +150,7 @@ LocalToNet/
 │   │   ├── registry.py       在线客户端表 + 端口归属路由
 │   │   ├── pending.py        访客连接与数据通道的配对挂起
 │   │   ├── mapping.py        映射表与访客端口监听生命周期
-│   │   └── auth.py           鉴权扩展点
+│   │   └── auth.py           鉴权（放行 / 共享令牌，常量时间比较）
 │   ├── client/               客户端
 │   │   ├── core.py           控制长连接、心跳、重连
 │   │   └── forwarder.py      数据通道 + 内网后端连接
@@ -120,7 +161,7 @@ LocalToNet/
 │       ├── viewmodel.py      邮筒消息 → 表格与状态栏（纯逻辑）
 │       └── app.py            窗口、表格、按钮、状态栏、日志面板
 ├── examples/demo_backend.py  演示用内网 HTTP 服务
-└── tests/                    146 项测试（单测 + 端到端 + GUI）
+└── tests/                    158 项测试（单测 + 端到端 + GUI + 命令行）
 ```
 
 ## 协议
@@ -153,6 +194,10 @@ LocalToNet/
 > 相对教程协议表，本项目在 `register_ack` 上扩展了 `ok` / `code` / `msg` / `data_host` / `data_port`。
 > 前三个让客户端能区分"网络抖动"与"凭据错误"（403 属于永久失败，停止重试而非每 60 秒撞一次墙）；
 > 后两个让客户端的数据通道地址由服务端下发，同一份配置在本机演示与公网部署下都能直接跑。
+>
+> `code` 里有两类必须**分开对待**，混同任何一边都是 bug：
+> `403` 凭据不对 → **永久失败**，客户端停止重试；
+> `503`（`limits.max_clients` 已满）→ **暂时失败**，客户端继续退避重试。
 
 ## 核心机制
 
@@ -235,7 +280,7 @@ Linux 上若缺 tkinter，安装系统包 `python3-tk` 即可（Windows/macOS �
 | --- | --- | --- | --- |
 | 帧编解码 | `protocol.Codec` | 长度头 + JSON | msgpack / protobuf / 压缩 |
 | 指令处理 | `core.dispatcher.MessageDispatcher` | `@handler` 注册表 | 新增指令零侵入主循环 |
-| 客户端鉴权 | `server.auth.Authenticator` | `NoneAuthenticator` 放行 | Token / mTLS / SSO |
+| 客户端鉴权 | `server.auth.Authenticator` | `NoneAuthenticator` / `TokenAuthenticator`（共享令牌） | mTLS / 签名挑战 / SSO |
 | 端口路由策略 | `ClientRegistry(routing=...)` | 归属优先 → 首个在线 | 轮询 / 加权 / 标签路由 |
 | 映射持久化 | `server.mapping.MappingStore` | 内存 | JSON 文件 / SQLite / Redis |
 | 映射校验规则 | `core.rules.parse_mapping` | 服务端与 GUI 共用一份 | 增删规则只改这一处 |
@@ -255,9 +300,9 @@ python -m pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-当前 **146 项全部通过**（test_protocol 17 / test_config 22 / test_core 32 / test_e2e 12 /
-test_gui_model 47 / test_gui_bridge 10 / test_gui_controller 6），
-其中 12 项是真实拉起三件套、走真实 TCP 的端到端测试：
+当前 **158 项全部通过**（test_protocol 17 / test_config 22 / test_core 33 / test_e2e 16 /
+test_server_cli 7 / test_gui_model 47 / test_gui_bridge 10 / test_gui_controller 6），
+其中 16 项是真实拉起三件套、走真实 TCP 的端到端测试：
 
 | 用例 | 验证内容 |
 | --- | --- |
@@ -273,6 +318,17 @@ test_gui_model 47 / test_gui_bridge 10 / test_gui_controller 6），
 | 无映射规则 | `404`（竞态窗口分支） |
 | 未映射端口 | 根本不监听，连接直接被拒 |
 | 控制连接断开 | 客户端自动重连并重新认领端口 |
+| 鉴权通过 | 服务端开鉴权 + 客户端带对令牌 → 注册成功、映射生效、访客端口可访问 |
+| 令牌错误 | `403` → 客户端**只拨号一次**、状态 `stopped`、`CONTROL_LOST(fatal=True)` |
+| 令牌缺失 | 同上，症状与令牌错误完全一致 |
+| 容量已满 | `503` **不**被当成 fatal，客户端继续退避重试；已在线客户端不受影响 |
+
+> 后两条守的是同一条线：`403` 与 `503` 必须**分开处理**——凭据错重试无意义（停手），
+> 容量满重试有意义（继续）。把它们统一成任一种都是 bug。
+
+`tests/test_server_cli.py` 覆盖服务端命令行参数（`--token` / `--no-auth` 与配置优先级铁律），
+其中一条专门钉死"仓库自带的 `config.json` 必须保持 `auth.enabled=false`"——
+免得哪天演示配置被顺手改成要令牌，本地 demo 突然跑不起来。
 
 `tests/test_core.py` 另有针对 `pipe_both` 交叉配对的回归用例——
 上行与下行必须写向**对侧**，写成 `a_reader → a_writer` 就成了原地回环，
@@ -294,7 +350,11 @@ GUI 相关的三项测试（`test_gui_model` / `test_gui_bridge` / `test_gui_con
 - 图形界面需要 tkinter（CPython 标准库，不算第三方依赖）；
   精简安装的 Linux 上可能需要 `apt install python3-tk`
 - 未内置限速与流量统计页面（接口均已预留）
-- 明文传输，公网部署建议置于 TLS 终止层之后，或按上面的扩展点接入加密
+- **传输仍是明文**：令牌放在 `register_client` 帧里走 TCP，`client.json` 里也明文落盘。
+  公网部署建议置于 TLS 终止层之后，或按上面的扩展点接入加密
+- 鉴权只有**共享令牌**，没有按客户端区分身份：持有令牌的客户端可以认领任意访客端口；
+  且令牌以命令行参数给出时会出现在进程列表里（生产环境优先用环境变量或受限权限的配置文件）
+- 令牌是**静态**的：轮换需要重启服务端（换成 mTLS / 签名挑战 / 一次性票据见扩展点表）
 
 后续计划：映射持久化（换 `MappingStore` 实现，界面无须改动）→ 按请求的带宽统计 →
-限流配额 → TLS 与鉴权强化 → 服务端侧管理界面。
+限流配额（复用 `403` / `503` 语义）→ TLS 与证书分发 → 服务端侧管理界面。

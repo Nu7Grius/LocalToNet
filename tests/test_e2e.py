@@ -17,12 +17,17 @@ tests/test_e2e.py —— 端到端链路验证
 10. 无映射规则               404（竞态窗口分支）
 11. 未映射的端口             根本不监听，连接直接被拒
 12. 控制连接断开             客户端自动重连并重新认领端口
+13. 鉴权通过                 服务端开鉴权 + 客户端带对令牌 → 正常注册并转发流量
+14. 令牌错误                 403 → 客户端**只拨号一次**、状态 stopped、CONTROL_LOST(fatal=True)
+15. 令牌缺失                 同上；不配令牌的客户端不会陷入"每 60 秒撞一次墙"
+16. 容量已满                 503 属于**暂时性**失败 → 客户端继续退避重试，绝不当作 fatal
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any, Dict, List
 
 import pytest
 
@@ -334,5 +339,136 @@ def test_client_reconnects_after_control_connection_drops() -> None:
             recovery = await http_request(harness.public_port, "/echo?msg=back")
             assert recovery.status == 200
             assert recovery.body == b"back\n"
+
+    asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------- #
+# 13 ~ 16：鉴权与容量语义
+#
+# 这两类拒绝必须**分开处理**，混同任何一边都是 bug：
+#   403 = 凭据不对，重试多少次都一样   → 永久失败，立刻停
+#   503 = 容量暂时满了，回头可能就好了 → 暂时失败，继续退避重试
+# --------------------------------------------------------------------------- #
+
+AUTH_TOKEN = "s3cret-token"
+
+
+def _enable_server_auth(config) -> None:
+    config.auth.enabled = True
+    config.auth.token = AUTH_TOKEN
+
+
+def test_auth_token_allows_registration_and_traffic() -> None:
+    def use_token(config) -> None:
+        config.auth_token = AUTH_TOKEN
+
+    async def scenario() -> None:
+        async with TunnelHarness(
+            configure_server=_enable_server_auth,
+            configure_client=use_token,
+        ) as harness:
+            assert harness.server is not None and harness.client is not None
+            assert harness.server.registry.has(harness.client.client_id)
+            assert harness.server.registry.owner_of(harness.backend.port) == harness.client.client_id
+            assert harness.server.stats.registrations_rejected == 0
+
+            response = await http_request(harness.public_port, "/echo?msg=hello%20auth")
+            assert response.status == 200
+            assert response.body == b"hello auth\n"
+
+    asyncio.run(scenario())
+
+
+async def _assert_rejected_permanently(harness: TunnelHarness) -> None:
+    """共用的断言体：注册被 403 拒后，客户端必须停手且只拨号过一次。"""
+    assert harness.server is not None and harness.client is not None
+    client = harness.client
+
+    connects: List[int] = []
+    lost: List[Dict[str, Any]] = []
+    client.events.on(EventType.CONTROL_CONNECTED, lambda **_: connects.append(1))
+    client.events.on(EventType.CONTROL_LOST, lambda **payload: lost.append(payload))
+
+    await harness.wait_until(lambda: client.state == "stopped", what="客户端进入 stopped")
+
+    assert connects == [1], f"403 之后不该再拨号，实际拨号 {len(connects)} 次"
+    assert client.stats.reconnects == 0
+    assert [event.get("fatal") for event in lost] == [True], f"应恰好有一条 fatal 的 CONTROL_LOST，实际 {lost}"
+    reason = str(lost[0].get("reason"))
+    assert "403" in reason, f"停止重试的理由应指向 403，实际 {reason!r}"
+    assert reason.count("[403]") == 1, f"回执的 msg 已带 code，客户端不该再叠一层前缀：{reason!r}"
+    assert harness.server.stats.registrations_rejected == 1
+    assert harness.server.registry.has(client.client_id) is False
+
+    # 再等若干个退避周期复检：确认没有"偷偷重试"，而不只是"还没来得及重试"
+    await asyncio.sleep(0.4)
+    assert client.state == "stopped"
+    assert client.stats.reconnects == 0
+    assert connects == [1]
+    assert harness.server.stats.registrations_rejected == 1
+
+
+def test_wrong_token_is_rejected_permanently() -> None:
+    def use_wrong_token(config) -> None:
+        config.auth_token = "definitely-not-the-token"
+
+    async def scenario() -> None:
+        async with TunnelHarness(
+            configure_server=_enable_server_auth,
+            configure_client=use_wrong_token,
+            expect_online=False,
+        ) as harness:
+            await _assert_rejected_permanently(harness)
+
+    asyncio.run(scenario())
+
+
+def test_missing_token_is_rejected_permanently() -> None:
+    """客户端完全不带令牌（``auth_token`` 留空）时，症状必须与令牌错误完全一致。"""
+
+    async def scenario() -> None:
+        async with TunnelHarness(
+            configure_server=_enable_server_auth,
+            expect_online=False,
+        ) as harness:
+            await _assert_rejected_permanently(harness)
+
+    asyncio.run(scenario())
+
+
+def test_client_capacity_limit_is_retriable_not_fatal() -> None:
+    """503 是"暂时没位置"，不是"你没资格"——客户端必须继续退避重试。"""
+
+    def limit_to_one_client(config) -> None:
+        config.limits.max_clients = 1
+
+    async def scenario() -> None:
+        async with TunnelHarness(configure_server=limit_to_one_client) as harness:
+            assert harness.server is not None and harness.client is not None
+            first = harness.client
+
+            second_config = harness.build_client_config(client_id="test-over-capacity")
+            second = TunnelClient(second_config)
+            lost: List[Dict[str, Any]] = []
+            second.events.on(EventType.CONTROL_LOST, lambda **payload: lost.append(payload))
+            task = asyncio.create_task(second.run(), name="over-capacity-client")
+            try:
+                await harness.wait_until(lambda: second.stats.reconnects >= 1, what="第二个客户端退避重试")
+
+                assert second.state != "stopped", "503 不该被当成 fatal 而停止重试"
+                assert all(not event.get("fatal") for event in lost), f"不应出现 fatal 事件：{lost}"
+                assert harness.server.registry.has("test-over-capacity") is False
+                assert harness.server.stats.registrations_rejected >= 1
+
+                # 已在线的那一个完全不受影响
+                response = await http_request(harness.public_port, "/echo?msg=still-mine")
+                assert response.status == 200
+                assert response.body == b"still-mine\n"
+                assert harness.server.registry.owner_of(harness.backend.port) == first.client_id
+            finally:
+                await second.stop()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(scenario())

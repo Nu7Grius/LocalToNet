@@ -7,6 +7,8 @@ server.py —— 服务端入口（公网侧）
     python server.py                          # 读取同目录 config.json
     python server.py -c my.json               # 指定配置
     python server.py --mapping 9028:8000      # 临时映射，覆盖配置文件里的 mapping
+    python server.py --token s3cret           # 开启 token 鉴权
+    python server.py --no-auth                # 强制关闭鉴权（覆盖 JSON / 环境变量）
 
 配置文件格式见 ``config.json``；所有字段都可用 ``LOCALTONET_`` 前缀的环境变量覆盖，
 命令行参数的优先级最高（默认值 < JSON < 环境变量 < 命令行）。
@@ -63,6 +65,17 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="公网:本地",
         help="端口映射，可重复；一旦指定就整体替换配置文件里的 mapping",
     )
+    auth_group = parser.add_mutually_exclusive_group()
+    auth_group.add_argument(
+        "--token",
+        metavar="令牌",
+        help="开启 token 鉴权（等价于 auth.enabled=true + auth.token），客户端须带同一令牌",
+    )
+    auth_group.add_argument(
+        "--no-auth",
+        action="store_true",
+        help="强制关闭鉴权，覆盖配置文件与环境变量里的设置（本地演示用）",
+    )
     parser.add_argument("--log-level", help="日志级别（DEBUG/INFO/WARNING/ERROR）")
     parser.add_argument("--log-file", help="同时写入日志文件")
     return parser
@@ -89,6 +102,17 @@ def load_config(args: argparse.Namespace) -> ServerConfig:
         config.advertise_host = args.advertise_host
     if args.mapping:
         config.mapping = list(args.mapping)
+    # 鉴权：命令行优先级最高（默认值 < JSON < 环境变量 < 命令行）。
+    # --token 的 default 必须是 None，否则无法区分"没给"和"给了空串"。
+    if args.no_auth:
+        config.auth.enabled = False
+        config.auth.token = ""
+    if args.token is not None:
+        token = args.token.strip()
+        if not token:
+            raise ConfigError("--token 不能为空；若要关闭鉴权请改用 --no-auth")
+        config.auth.token = token
+        config.auth.enabled = True
     if args.log_level:
         config.log.level = args.log_level.upper()
     if args.log_file:

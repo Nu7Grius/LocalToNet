@@ -170,12 +170,16 @@ class TunnelHarness:
         configure_server: Optional[Callable[[ServerConfig], None]] = None,
         configure_client: Optional[Callable[[ClientConfig], None]] = None,
         client_id: Optional[str] = None,
+        expect_online: bool = True,
     ) -> None:
         self._start_client = start_client
         self._local_ports = list(local_ports) if local_ports else None
         self._configure_server = configure_server
         self._configure_client = configure_client
         self._client_id = client_id or f"test-{uuid.uuid4().hex[:8]}"
+        # 注册注定失败（如鉴权被拒、容量已满）的用例要主动关掉等待，
+        # 否则 start() 里的 wait_online 会先抛 AssertionError 把真实断言盖掉
+        self._expect_online = expect_online
 
         self.backend = DemoBackend("127.0.0.1", 0)
         self.server: Optional[TunnelServer] = None
@@ -234,7 +238,8 @@ class TunnelHarness:
         if self._start_client:
             await self.start_client(backend_port)
             # 必须等到注册真正完成，否则第一个请求会撞上"还没有在线客户端"的窗口
-            await self.wait_online()
+            if self._expect_online:
+                await self.wait_online()
         return self
 
     def build_client_config(

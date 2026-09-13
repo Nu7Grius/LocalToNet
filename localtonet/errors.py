@@ -37,6 +37,15 @@ class TunnelError(Exception):
     def __str__(self) -> str:
         return f"[{self.code}] {super().__str__()}"
 
+    @property
+    def message(self) -> str:
+        """不带 ``code`` 前缀的原始消息。
+
+        回执里的 ``msg`` 已经有独立的 ``code`` 字段，再塞一份前缀就会出现
+        ``[403] [403] 客户端提供的 token 不合法`` 这种叠字；日志里同理。
+        """
+        return Exception.__str__(self)
+
 
 class AuthError(TunnelError):
     """客户端鉴权失败。"""
