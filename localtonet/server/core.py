@@ -35,11 +35,12 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from config import ConfigError, MappingRule, ServerConfig, check_port
+from config import ConfigError, ServerConfig
 from localtonet.core.dispatcher import MessageDispatcher, handler
 from localtonet.core.events import EventBus, EventType
 from localtonet.core.heartbeat import Watchdog
 from localtonet.core.pipe import close_writer, pipe_both
+from localtonet.core.rules import parse_mapping, parse_ports
 from localtonet.core.runtime import cancel_all, peer_name, spawn
 from localtonet.errors import AuthError, TunnelError
 from localtonet.server.auth import Authenticator, build_authenticator
@@ -297,7 +298,7 @@ class TunnelServer:
         client_id = client_id.strip()
 
         try:
-            local_ports = self._parse_ports(msg.get("local_ports"))
+            local_ports = parse_ports(msg.get("local_ports"))
         except ConfigError as exc:
             await self._send_raw(
                 writer,
@@ -441,7 +442,7 @@ class TunnelServer:
             return
 
         try:
-            rules = self._parse_mapping(raw)
+            rules = parse_mapping(raw)
             diff = await self._mapping.apply(rules)
         except (ConfigError, TunnelError) as exc:
             self._log.warning("客户端 %s 提交的映射更新被拒绝：%s", session.client_id, exc)
@@ -675,37 +676,6 @@ class TunnelServer:
         if isinstance(info, tuple) and info:
             return str(info[0])
         return self._config.control.host
-
-    @staticmethod
-    def _parse_ports(raw: Any) -> List[int]:
-        if not isinstance(raw, list) or not raw:
-            raise ConfigError("local_ports 必须是非空端口数组")
-        ports: List[int] = []
-        for index, item in enumerate(raw):
-            if isinstance(item, bool) or not isinstance(item, int):
-                raise ConfigError(f"local_ports[{index}] 必须是整数端口")
-            ports.append(check_port(item, f"local_ports[{index}]"))
-        if len(set(ports)) != len(ports):
-            raise ConfigError("local_ports 存在重复端口")
-        return ports
-
-    @staticmethod
-    def _parse_mapping(raw: List[Any]) -> List[MappingRule]:
-        if not raw:
-            raise ConfigError("mapping 不能为空，至少保留一条映射")
-        rules = []
-        seen: Dict[int, int] = {}
-        for index, item in enumerate(raw):
-            if not isinstance(item, dict):
-                raise ConfigError(f"mapping[{index}] 必须是对象")
-            rule = MappingRule.from_dict(item, f"mapping[{index}]")
-            if rule.public_port in seen:
-                raise ConfigError(
-                    f"mapping[{index}].public_port={rule.public_port} 与 mapping[{seen[rule.public_port]}] 重复"
-                )
-            seen[rule.public_port] = index
-            rules.append(rule)
-        return rules
 
     @staticmethod
     async def _reply_http(writer: asyncio.StreamWriter, status: int, message: str) -> None:
