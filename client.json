@@ -1,0 +1,25 @@
+{
+  "server_host": "127.0.0.1",
+  "control_port": 7000,
+  "data_port": 7001,
+  "client_id": "",
+  "local_host": "127.0.0.1",
+  "local_ports": [8000],
+  "timeouts": {
+    "heartbeat_interval": 30,
+    "pong_timeout": 10,
+    "client_idle_timeout": 120,
+    "watchdog_interval": 10,
+    "pair_timeout": 15,
+    "connect_timeout": 5
+  },
+  "reconnect": {
+    "initial_delay": 1,
+    "max_delay": 60,
+    "multiplier": 2,
+    "jitter": 0.5
+  },
+  "auth_token": "",
+  "limits": { "max_msg_len": 10485760, "max_clients": 64, "max_mappings": 32 },
+  "log": { "level": "INFO", "file": "" }
+}

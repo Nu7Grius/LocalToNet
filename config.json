@@ -1,0 +1,32 @@
+{
+  "name": "localtonet-demo-server",
+  "control": { "host": "0.0.0.0", "port": 7000 },
+  "data": { "host": "0.0.0.0", "port": 7001 },
+  "advertise_host": "",
+  "mapping": [
+    {
+      "public_port": 9028,
+      "local_port": 8000,
+      "host": "0.0.0.0",
+      "local_host": "127.0.0.1",
+      "remark": "演示映射：公网 9028 -> 内网 8000"
+    }
+  ],
+  "timeouts": {
+    "heartbeat_interval": 30,
+    "pong_timeout": 10,
+    "client_idle_timeout": 120,
+    "watchdog_interval": 10,
+    "pair_timeout": 15,
+    "connect_timeout": 5
+  },
+  "reconnect": {
+    "initial_delay": 1,
+    "max_delay": 60,
+    "multiplier": 2,
+    "jitter": 0.5
+  },
+  "auth": { "enabled": false, "token": "" },
+  "limits": { "max_msg_len": 10485760, "max_clients": 64, "max_mappings": 32 },
+  "log": { "level": "INFO", "file": "" }
+}

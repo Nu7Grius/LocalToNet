@@ -1,0 +1,338 @@
+# -*- coding: utf-8 -*-
+"""
+tests/test_e2e.py —— 端到端链路验证
+=====================================
+每条用例都真实拉起 **内网后端 + 服务端 + 客户端**，走真实 TCP，不做 mock。
+覆盖清单：
+
+1. 基础打通                  公网端口请求能到达内网后端并原样返回
+2. 并发 20 请求              不同 conn_id 不会串流量
+3. 1MB 大包                  长连接大流量不丢字节
+4. 流式响应                  分块到达顺序正确、没被整段缓冲
+5. 无在线客户端              502 No client online
+6. 客户端掉线                502
+7. 内网后端未启动            conn_error 上报 + 502（不是空回复）
+8. 端口独占                  第二个客户端认领同一端口被拒，老客户端不受影响
+9. 动态映射                  set_mapping 加端口立即可用、删端口立即失效
+10. 无映射规则               404（竞态窗口分支）
+11. 未映射的端口             根本不监听，连接直接被拒
+12. 控制连接断开             客户端自动重连并重新认领端口
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+
+import pytest
+
+from config import MappingRule
+from localtonet.client.core import TunnelClient
+from localtonet.core.events import EventType
+from tests.helpers import TunnelHarness, free_ports, http_request, http_stream_chunks
+
+# --------------------------------------------------------------------------- #
+# 1 ~ 4：正向链路
+# --------------------------------------------------------------------------- #
+
+
+def test_basic_request_round_trip() -> None:
+    async def scenario() -> None:
+        async with TunnelHarness() as harness:
+            response = await http_request(harness.public_port, "/")
+            assert response.status == 200
+            payload = json.loads(response.text)
+            assert payload["ok"] is True
+            assert payload["path"] == "/"
+
+            echoed = await http_request(harness.public_port, "/echo?msg=hello%20tunnel")
+            assert echoed.status == 200
+            assert echoed.body == b"hello tunnel\n"
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_requests_keep_their_own_responses() -> None:
+    """每条请求必须拿回自己的响应——这是 conn_id 配对是否正确的硬指标。"""
+
+    async def scenario() -> None:
+        async with TunnelHarness() as harness:
+            paths = [f"/echo?msg=req-{index:02d}" for index in range(20)]
+            responses = await asyncio.gather(*(http_request(harness.public_port, path) for path in paths))
+
+            for index, response in enumerate(responses):
+                assert response.status == 200, f"第 {index} 条请求状态码异常"
+                assert response.body == f"req-{index:02d}\n".encode("utf-8"), f"第 {index} 条请求串流了"
+
+            assert harness.server is not None
+            assert harness.server.stats.requests_total >= 20
+            assert harness.server.stats.requests_failed == 0
+
+    asyncio.run(scenario())
+
+
+def test_one_megabyte_payload_is_intact() -> None:
+    async def scenario() -> None:
+        async with TunnelHarness() as harness:
+            response = await http_request(harness.public_port, "/big?kb=1024", timeout=30.0)
+
+            assert response.status == 200
+            assert len(response.body) == 1024 * 1024
+            block = bytes(index % 251 for index in range(1024))
+            assert response.body[:1024] == block
+            assert response.body[-1024:] == block
+
+            # 转发协程在连接收尾后才回填计数，所以这里等统计追上而不是立刻断言
+            assert harness.server is not None
+            await harness.wait_until(
+                lambda: harness.server.stats.bytes_download >= 1024 * 1024,  # type: ignore[union-attr]
+                what="服务端下行字节统计",
+            )
+
+    asyncio.run(scenario())
+
+
+def test_streaming_chunks_arrive_in_order() -> None:
+    """流式场景：既要顺序对，也要真的分批到达（说明隧道没有把整段缓冲后再吐）。"""
+
+    async def scenario() -> None:
+        async with TunnelHarness() as harness:
+            chunks = await http_stream_chunks(
+                harness.public_port,
+                "/stream?chunks=20&interval=0.02",
+                chunk_size=32,
+            )
+            raw = b"".join(chunks)
+            _, _, body = raw.partition(b"\r\n\r\n")
+            lines = [line for line in body.decode("utf-8").splitlines() if line]
+
+            assert lines == [f"chunk-{index:04d}" for index in range(20)]
+            assert len(chunks) >= 3, f"应分多次到达，实际只收到 {len(chunks)} 段"
+
+    asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------- #
+# 5 ~ 7：错误兜底
+# --------------------------------------------------------------------------- #
+
+
+def test_502_when_no_client_online() -> None:
+    async def scenario() -> None:
+        async with TunnelHarness(start_client=False) as harness:
+            response = await http_request(harness.public_port, "/")
+            assert response.status == 502
+            assert "No client online" in response.text
+
+            assert harness.server is not None
+            assert harness.server.stats.requests_failed == 1
+
+    asyncio.run(scenario())
+
+
+def test_502_after_client_goes_offline() -> None:
+    async def scenario() -> None:
+        async with TunnelHarness() as harness:
+            assert (await http_request(harness.public_port, "/")).status == 200
+
+            assert harness.client is not None
+            await harness.client.stop()
+            await harness.wait_offline()
+
+            response = await http_request(harness.public_port, "/")
+            assert response.status == 502
+
+            assert harness.server is not None
+            assert harness.server.registry.owner_of(harness.backend.port) is None
+
+    asyncio.run(scenario())
+
+
+def test_conn_error_is_reported_when_backend_is_down() -> None:
+    """内网后端没启动时，访客必须拿到 502，且理由要指向**真正的失败原因**。
+
+    这里刻意把客户端的 ``connect_timeout`` 压到 0.5s、服务端的 ``pair_timeout`` 放宽到 5s——
+    两者的大小关系就是这条用例要守住的约束：服务端等不到配对时，
+    必须已经收到客户端的 ``conn_error``，而不是自己先超时并报一句含糊的"配对超时"。
+    """
+    dead_port = free_ports(1)[0]
+
+    def configure_server(config) -> None:
+        config.mapping[0].local_port = dead_port
+        config.timeouts.pair_timeout = 5.0
+
+    def configure_client(config) -> None:
+        config.timeouts.connect_timeout = 0.5
+
+    async def scenario() -> None:
+        async with TunnelHarness(
+            local_ports=[dead_port],
+            configure_server=configure_server,
+            configure_client=configure_client,
+        ) as harness:
+            assert harness.server is not None
+            reports = []
+            harness.server.events.on(EventType.CONN_ERROR, lambda **payload: reports.append(payload))
+
+            response = await http_request(harness.public_port, "/")
+
+            assert response.status == 502
+            assert "内网后端" in response.text, f"应当透传真实原因，实际为：{response.text!r}"
+            assert reports, "服务端应当收到客户端的 conn_error 上报"
+            assert reports[0]["local_port"] == dead_port
+
+            assert harness.client is not None
+            await harness.wait_until(
+                lambda: harness.client.stats.forwards_failed >= 1,  # type: ignore[union-attr]
+                what="客户端转发失败计数",
+            )
+
+    asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------- #
+# 8 ~ 9：多客户端与动态映射
+# --------------------------------------------------------------------------- #
+
+
+def test_second_client_cannot_steal_an_owned_port() -> None:
+    async def scenario() -> None:
+        async with TunnelHarness() as harness:
+            assert harness.client is not None and harness.server is not None
+
+            second_config = harness.build_client_config(client_id="test-second")
+            second = TunnelClient(second_config)
+            task = asyncio.create_task(second.run(), name="second-client")
+            try:
+                await harness.wait_until(
+                    lambda: harness.server is not None and harness.server.registry.has("test-second"),
+                    what="第二个客户端注册",
+                )
+
+                assert second.claimed_ports == []
+                assert second.conflicted_ports == [harness.backend.port]
+                assert harness.server.registry.owner_of(harness.backend.port) == harness.client.client_id
+
+                # 老客户端完全不受影响
+                response = await http_request(harness.public_port, "/echo?msg=still-mine")
+                assert response.status == 200
+                assert response.body == b"still-mine\n"
+            finally:
+                await second.stop()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_set_mapping_adds_and_removes_guest_ports() -> None:
+    async def scenario() -> None:
+        async with TunnelHarness() as harness:
+            assert harness.client is not None
+            extra_port = free_ports(1)[0]
+
+            added = await harness.client.set_mapping(
+                [
+                    MappingRule(public_port=harness.public_port, local_port=harness.backend.port, host="127.0.0.1"),
+                    MappingRule(public_port=extra_port, local_port=harness.backend.port, host="127.0.0.1"),
+                ]
+            )
+            assert added["ok"] is True
+            assert extra_port in added["diff"]["added"]
+
+            await harness.wait_until(
+                lambda: len(harness.client.remote_mapping) == 2 if harness.client else False,
+                what="客户端收到新映射表",
+            )
+
+            dynamic = await http_request(extra_port, "/echo?msg=dynamic")
+            assert dynamic.status == 200
+            assert dynamic.body == b"dynamic\n"
+
+            removed = await harness.client.set_mapping(
+                [MappingRule(public_port=extra_port, local_port=harness.backend.port, host="127.0.0.1")]
+            )
+            assert removed["ok"] is True
+            assert harness.public_port in removed["diff"]["removed"]
+
+            with pytest.raises(OSError):
+                await http_request(harness.public_port, "/", timeout=3.0)
+
+            # 保留的那个端口仍然可用
+            assert (await http_request(extra_port, "/echo?msg=kept")).body == b"kept\n"
+
+    asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------- #
+# 10 ~ 12：边界与自愈
+# --------------------------------------------------------------------------- #
+
+
+def test_404_when_port_has_no_mapping_rule() -> None:
+    """404 只会在"连接已建立、映射紧接着被摘掉"的竞态窗口里出现。
+
+    要稳定复现这个窗口，就用一个中转监听把连接直接喂给服务端的访客处理函数——
+    除了入参端口是假的，走的是完全真实的处理路径与真实 socket。
+    """
+
+    async def scenario() -> None:
+        async with TunnelHarness() as harness:
+            assert harness.server is not None
+            unmapped_port = free_ports(1)[0]
+
+            async def relay(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                await harness.server._handle_visitor(reader, writer, unmapped_port)  # type: ignore[union-attr]
+
+            relay_port = free_ports(1)[0]
+            relay_server = await asyncio.start_server(relay, "127.0.0.1", relay_port)
+            try:
+                response = await http_request(relay_port, "/")
+                assert response.status == 404
+                assert "No mapping for this port" in response.text
+            finally:
+                relay_server.close()
+                await relay_server.wait_closed()
+
+    asyncio.run(scenario())
+
+
+def test_unmapped_port_is_not_listened_at_all() -> None:
+    """没有被映射的端口，服务端根本不会去监听——访问时是连接被拒，而不是 404。"""
+
+    async def scenario() -> None:
+        async with TunnelHarness() as harness:
+            assert harness.server is not None
+            assert harness.server.mapping.listen_ports() == [harness.public_port]
+
+            with pytest.raises(OSError):
+                await http_request(free_ports(1)[0], "/", timeout=3.0)
+
+    asyncio.run(scenario())
+
+
+def test_client_reconnects_after_control_connection_drops() -> None:
+    async def scenario() -> None:
+        async with TunnelHarness() as harness:
+            assert harness.client is not None and harness.server is not None
+            assert (await http_request(harness.public_port, "/")).status == 200
+
+            reconnected = asyncio.Event()
+            harness.server.events.on(EventType.CLIENT_CONNECTED, lambda **_: reconnected.set())
+
+            # 从服务端一侧粗暴掐断控制连接，模拟网络抖动 / 对端进程被强杀
+            session = harness.server.registry.get(harness.client.client_id)
+            assert session is not None
+            session.writer.close()
+
+            await asyncio.wait_for(reconnected.wait(), timeout=8.0)
+            await harness.wait_online(timeout=8.0)
+
+            assert harness.client.stats.reconnects >= 1
+            assert harness.server.registry.owner_of(harness.backend.port) == harness.client.client_id
+
+            recovery = await http_request(harness.public_port, "/echo?msg=back")
+            assert recovery.status == 200
+            assert recovery.body == b"back\n"
+
+    asyncio.run(scenario())

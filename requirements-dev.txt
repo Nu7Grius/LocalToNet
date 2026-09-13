@@ -1,0 +1,3 @@
+# 开发期依赖：运行时零依赖，仅测试需要 pytest
+#   python -m pip install -r requirements-dev.txt
+pytest>=8.0
