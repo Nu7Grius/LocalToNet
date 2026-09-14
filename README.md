@@ -21,7 +21,9 @@
 - **带宽限流**：按客户端、按方向（上行/下行）独立限速，令牌桶平滑而非"每秒硬切"
 - **并发配额**：限制单客户端同时在途的转发数，超了直接回 `429`，不排队、不拖垮服务端
 - **映射持久化**：`--mapping-store file` 把映射表落到 JSON，重启服务端不再回到配置文件的状态
-- **零运行时依赖**：纯标准库（界面用自带的 tkinter），Python 3.11+（开发环境用 3.13）
+- **传输加密（TLS）**：控制通道与数据通道可选走 TLS（默认关闭＝明文），令牌不再以明文出现在线路上；
+  支持双向认证（mTLS）作为可选纵深防御
+- **零运行时依赖**：纯标准库（界面用自带的 tkinter，加密用自带的 `ssl`），Python 3.11+（开发环境用 3.13）
 
 ## 架构
 
@@ -127,6 +129,77 @@ python client.py --server 1.2.3.4:7000 --local-ports 8000,8080 --client-id my-pc
 
 > ⚠️ 令牌目前是**明文**放在 `register_client` 帧里走 TCP，`client.json` 里也是明文落盘。
 > 公网部署请置于 TLS 终止层（Nginx / Caddy）之后，或按「扩展点」表接入传输加密。
+
+## 传输加密（TLS）
+
+控制通道与数据通道可以走 TLS，令牌就不会再以明文出现在公网线路上。**默认完全关闭**——
+不配任何 TLS 字段时行为与之前一字不差（明文），本地 demo 不受影响。
+
+**只加密两跳**：客户端 ↔ 服务端的控制通道与数据通道。客户端 → 内网后端那一跳走本机/内网，
+**永远明文**（给内网那一跳套 TLS 是自我感动，还会堵死"后端是明文 HTTP"这个绝大多数场景）。
+访客端口（9028 等）的 TLS 终止**本轮不做**：若你的后端本来就是 HTTPS，它已经能原样穿透隧道跑
+（服务端纯字节搬运、不做 TLS 终止），这是零配置就有的能力；若你要"访客侧加密 + 后端明文"，
+更合适的是在隧道前面放 Nginx/Caddy 做 TLS 终止。
+
+### 快速开始
+
+先用自签证书（一次性测试材料见 `tests/certs/`，绝不可用于生产）：
+
+```bash
+# 服务端：给证书与私钥，即隐式开启 TLS
+python server.py --tls-cert tests/certs/server.pem --tls-key tests/certs/server.key
+
+# 客户端：给可信 CA（服务端是自签证书时必填）
+python client.py --server 127.0.0.1 --local-ports 8000 --tls-ca tests/certs/ca.pem
+```
+
+配置文件方式（服务端 `config.json` / 客户端 `client.json`）：
+
+```jsonc
+// 服务端
+{ "tls": { "enabled": true, "cert": "server.pem", "key": "server.key" } }
+// 客户端
+{ "tls": { "enabled": true, "ca": "ca.pem" } }
+```
+
+### 字段
+
+**服务端 `tls`**：
+
+| 字段 | 含义 | 默认 |
+| --- | --- | --- |
+| `enabled` | 是否开启 TLS | `false` |
+| `cert` / `key` | 证书链 / 私钥（PEM） | 空；`enabled` 时必须给 |
+| `require_client_cert` | 是否要求客户端证书（mTLS） | `false` |
+| `client_ca` | 校验客户端证书用的 CA，仅 mTLS 时用 | 空 |
+| `handshake_timeout` | TLS 握手超时（默认 60s 会让"明文打 TLS 端口"白占连接一分钟） | `10.0` |
+
+**客户端 `tls`**：
+
+| 字段 | 含义 | 默认 |
+| --- | --- | --- |
+| `enabled` | 是否开启 TLS | `false` |
+| `ca` | 可信 CA；留空用系统信任库（服务端是公网证书时） | 空 |
+| `cert` / `key` | 客户端证书/私钥，仅服务端开 mTLS 时用（须成对） | 空 |
+| `check_hostname` | 是否校验主机名（关了仍校验证书链） | `true` |
+| `skip_verify` | 完全跳过校验（**仅调试**，会记 WARNING） | `false` |
+
+命令行开关（优先级高于配置）：服务端 `--tls-cert/--tls-key/--tls-client-ca/--no-tls`；
+客户端 `--tls-ca/--tls-cert/--tls-key/--tls-skip-verify/--no-tls`。`gui.py` 与 `client.py` 参数一致，
+自动继承。`--no-tls` 是本地演示逃生门（命令行优先级最高，能覆盖配置/环境变量里开着的 TLS）。
+环境变量对应 `LOCALTONET_TLS_*`（如 `LOCALTONET_TLS_CERT`、`LOCALTONET_TLS_CA`）。
+
+### 认证方向与失败语义
+
+- **默认单向**：客户端验服务端证书（信任锚来自 `tls.ca` 或系统信任库）。应用层已有共享令牌做身份
+  校验，mTLS 是**纵深防御**而非必需品——通过 `require_client_cert` + `client_ca` 单独开启。
+- **证书校验失败绝不静默降级**：自签证书没给 CA、主机名不匹配、mTLS 缺客户端证书，都会在握手阶段
+  明确报错；`skip_verify` 必须显式开启才生效，且会打一条 WARNING。
+- **TLS 握手失败 = 永久失败**：与 403 同类。客户端立即停手、状态 `stopped`、退出码 `1`，
+  **不会**每 60s 撞一次墙。两端 TLS 配置不一致（一端明文一端加密）也会被识别并停手，
+  服务端侧另有一条日志点破"长度头非法，常见原因是两端 TLS 配置不一致"。
+
+> 回执/展示仍用 `exc.message`、日志用 `str(exc)` 的约定不变；TLS 只影响传输层，协议帧格式零改动。
 
 ## 限流、配额与映射持久化
 
@@ -247,6 +320,7 @@ LocalToNet/
 │   │   ├── backoff.py        指数退避
 │   │   ├── events.py         事件总线（GUI / 指标挂载点）
 │   │   ├── rules.py          端口与映射表校验（服务端与 GUI 共用同一份规则）
+│   │   ├── tls.py            TLS 上下文构建（服务端/客户端，建一次全程复用）
 │   │   └── runtime.py        后台任务托管、对端地址格式化
 │   ├── server/               服务端
 │   │   ├── core.py           三通道编排
@@ -264,7 +338,7 @@ LocalToNet/
 │       ├── viewmodel.py      邮筒消息 → 表格与状态栏（纯逻辑）
 │       └── app.py            窗口、表格、按钮、状态栏、日志面板
 ├── examples/demo_backend.py  演示用内网 HTTP 服务
-└── tests/                    231 项测试（单测 + 端到端 + GUI + 命令行）
+└── tests/                    255 项测试（单测 + 端到端 + GUI + 命令行 + TLS）
 ```
 
 ## 协议
@@ -411,7 +485,7 @@ Linux 上若缺 tkinter，安装系统包 `python3-tk` 即可（Windows/macOS �
 | 映射校验规则 | `core.rules.parse_mapping` | 服务端与 GUI 共用一份 | 增删规则只改这一处 |
 | 界面与观测 | `core.events.EventBus` | tkinter GUI + 结构化日志 | Web 界面 / Prometheus |
 | 限流配额 | `core.pipe.RateLimitHook` | `ClientRateLimiter`（令牌桶，按客户端 × 方向） | 加权公平队列 / 按端口限速 |
-| 传输加密 | 建立连接处 | 明文 | TLS / 会话密钥 |
+| 传输加密 | 建立连接处 | 明文 / TLS（`core.tls` 建上下文） | 访客端口 TLS 终止 / 会话密钥 |
 | 超时参数 | `config.Timeouts` | 集中默认值 | 环境变量 / 运行时可调 |
 
 事件总线已预留 `REQUEST_START` / `REQUEST_END` / `CONN_ERROR` / `MAPPING_CHANGED` 等事件，
@@ -425,9 +499,9 @@ python -m pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-当前 **231 项全部通过**（test_protocol 17 / test_config 40 / test_core 40 / test_e2e 21 /
-test_server_cli 13 / test_client_cli 4 / test_limiter 12 / test_mapping_store 21 /
-test_gui_model 47 / test_gui_bridge 10 / test_gui_controller 6），
+当前 **255 项全部通过**（test_protocol 17 / test_config 48 / test_core 40 / test_e2e 21 /
+test_server_cli 17 / test_client_cli 5 / test_limiter 12 / test_mapping_store 21 /
+test_tls 10 / test_gui_model 47 / test_gui_bridge 10 / test_gui_controller 6），
 其中 21 项是真实拉起三件套、走真实 TCP 的端到端测试：
 
 | 用例 | 验证内容 |
@@ -457,18 +531,26 @@ test_gui_model 47 / test_gui_bridge 10 / test_gui_controller 6），
 > 后两条守的是同一条线：`403` 与 `503` 必须**分开处理**——凭据错重试无意义（停手），
 > 容量满重试有意义（继续）。把它们统一成任一种都是 bug。
 
+`tests/test_tls.py`（10 项）覆盖传输加密，守四条验收线：明文与 TLS 两套端到端用例**并存且都绿**
+（加密不取代明文）；**证伪用例**——服务端只开 TLS 时明文客户端连不上（证明加密真在生效，而不是
+"配了但没起作用"）；**证书校验失败显式报错、不静默降级**（自签不给 CA、主机名不匹配、mTLS 缺证书
+三种都测，`skip_verify` 必须显式开启才生效）；**TLS 握手失败 = 永久失败**（客户端停手、退出码 1，
+不无限退避重试）。测试证书是 `tests/certs/` 里入库的一次性材料（有效期 30 年，见其 README），
+`pytest` 路径上不调用 openssl——保持"零运行时依赖"也适用于测试。
+
 `tests/test_limiter.py` 用假时钟（记录每次 sleep 的时长）断言令牌桶**真的在等**而不是空转：
 初始桶是满的、请求大于桶容量时被拆分且总量守恒、`rate <= 0` 被拒、禁用时不创建任何桶。
 `tests/test_mapping_store.py` 覆盖文件后端的原子写、损坏文件的 fail fast、写入失败的降级，
 以及"落盘文件权威、`config.json` 只当种子"这条语义（内存后端同样遵守，因为是存储层语义）。
 
-`tests/test_server_cli.py` 覆盖服务端命令行参数（`--token` / `--no-auth` / `--mapping-store*`
-与配置优先级铁律），其中一条专门钉死"仓库自带的 `config.json` 必须保持 `auth.enabled=false`"——
-免得哪天演示配置被顺手改成要令牌，本地 demo 突然跑不起来。
+`tests/test_server_cli.py` 覆盖服务端命令行参数（`--token` / `--no-auth` / `--mapping-store*` /
+`--tls-cert` / `--tls-key` / `--tls-client-ca` / `--no-tls` 与配置优先级铁律），其中一条专门钉死
+"仓库自带的 `config.json` 必须保持 `auth.enabled=false` 且 `tls.enabled=false`"——
+免得哪天演示配置被顺手改成要令牌/要证书，本地 demo 突然跑不起来。
 
 `tests/test_client_cli.py` 用子进程跑真实 `client.py` 对着一个"必定拒绝"的假服务端，钉死
-**退出码契约**：令牌错 → `1`；配置缺失 → `2`；`503` → 进程**继续活着**（不是启动即退），
-以及回执消息里**不带** `[403]` 前缀。
+**退出码契约**：令牌错 → `1`；配置缺失 → `2`；`503` → 进程**继续活着**（不是启动即退）；
+TLS 客户端连明文服务端 → `1`（TLS 错配是永久失败）；以及回执消息里**不带** `[403]` 前缀。
 
 `tests/test_core.py` 另有针对 `pipe_both` 交叉配对的回归用例——
 上行与下行必须写向**对侧**，写成 `a_reader → a_writer` 就成了原地回环，
@@ -493,10 +575,11 @@ GUI 相关的三项测试（`test_gui_model` / `test_gui_bridge` / `test_gui_con
   要做"按端口"或"按访客 IP"限速需换 `RateLimitHook` 实现
 - 限流与配额**只在服务端生效**：客户端侧不做自我限速（服务端是唯一的流量汇聚点，
   在汇聚点限流才能防住"客户端被改坏/恶意"的情况）
-- **传输仍是明文**：令牌放在 `register_client` 帧里走 TCP，`client.json` 里也明文落盘。
-  公网部署建议置于 TLS 终止层之后，或按上面的扩展点接入加密
+- **传输默认仍是明文**：不配 `tls` 时，令牌放在 `register_client` 帧里走 TCP。开 TLS 后**线路上**不再明文
+  （控制+数据两跳），但 `client.json` 里的 `auth_token` 仍是明文落盘、`--token` 会出现在进程列表里——
+  这两条 TLS 解决不了，生产环境优先用环境变量或受限权限的配置文件
 - 鉴权只有**共享令牌**，没有按客户端区分身份：持有令牌的客户端可以认领任意访客端口；
-  且令牌以命令行参数给出时会出现在进程列表里（生产环境优先用环境变量或受限权限的配置文件）
+  mTLS（`require_client_cert`）能在传输层加一道客户端证书身份，但分发/轮换客户端证书本身是运维负担
 - 令牌是**静态**的：轮换需要重启服务端（换成 mTLS / 签名挑战 / 一次性票据见扩展点表）
 
-后续计划：TLS 与证书分发 → 服务端侧管理界面 → 按请求的带宽统计与限流粒度细化。
+后续计划：访客端口 TLS 终止（独立可选开关，默认关）→ 服务端侧管理界面 → 按请求的带宽统计与限流粒度细化。

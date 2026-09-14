@@ -1,0 +1,7 @@
+[v3_server]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+# 故意只写一个**永远解析不到**的名字：用来造"证书链没问题、但主机名不匹配"这一种
+# 校验失败。比折腾 127.0.0.2 之类的回环地址可靠得多，也不依赖网卡配置。
+subjectAltName = DNS:localto.net.invalid

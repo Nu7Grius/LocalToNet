@@ -16,6 +16,7 @@ import contextlib
 import socket
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from config import ClientConfig, MappingRule, ServerConfig
@@ -23,7 +24,29 @@ from examples.demo_backend import DemoBackend
 from localtonet.client.core import TunnelClient
 from localtonet.server.core import TunnelServer
 
-__all__ = ["HttpResponse", "free_ports", "http_request", "http_stream_chunks", "TunnelHarness"]
+__all__ = [
+    "HttpResponse",
+    "free_ports",
+    "http_request",
+    "http_stream_chunks",
+    "TunnelHarness",
+    "CERTS_DIR",
+    "cert_path",
+    "key_path",
+]
+
+CERTS_DIR = Path(__file__).resolve().parent / "certs"
+"""测试证书目录。``gen_certs.sh`` 生成，pytest 只读、绝不调用 openssl。"""
+
+
+def cert_path(name: str) -> str:
+    """取测试证书的绝对路径。``name`` 如 ``ca`` / ``server`` / ``server-badhost`` / ``client``。"""
+    return str(CERTS_DIR / f"{name}.pem")
+
+
+def key_path(name: str) -> str:
+    """取测试证书私钥的绝对路径。"""
+    return str(CERTS_DIR / f"{name}.key")
 
 
 def free_ports(count: int) -> List[int]:

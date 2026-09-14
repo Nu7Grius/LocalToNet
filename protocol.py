@@ -32,6 +32,7 @@ __all__ = [
     "MAX_MSG_LEN",
     "MsgType",
     "ProtocolError",
+    "FrameLengthError",
     "Codec",
     "LengthPrefixedJSONCodec",
     "encode_frame",
@@ -56,6 +57,17 @@ MAX_MSG_LEN = 10 * 1024 * 1024
 
 class ProtocolError(Exception):
     """帧编解码异常：长度越界、非法 JSON、连接提前关闭。"""
+
+
+class FrameLengthError(ProtocolError):
+    """长度头声明的长度超出上限。
+
+    单独立一个子类，是因为它有一个高度特征化的成因：**对端把非本协议的数据
+    当成了帧**。最典型的就是 TLS 记录头被解析成帧长度——
+    TLS 1.3 的 ClientHello 前 4 字节是 ``16 03 01 …``，大端解析出来约 3.7 亿字节，
+    必然越界。服务端据此能在日志里直接点破"你可能连错加密方式了"，
+    而不是丢一句"长度非法"让人去猜。
+    """
 
 
 class MsgType:
@@ -128,7 +140,7 @@ class LengthPrefixedJSONCodec(Codec):
 
         (length,) = struct.unpack(HEADER_FMT, header)
         if length > self._max_msg_len:
-            raise ProtocolError(f"对端声明的消息体长度 {length} 超过上限 {self._max_msg_len}")
+            raise FrameLengthError(f"对端声明的消息体长度 {length} 超过上限 {self._max_msg_len}")
 
         try:
             body = await reader.readexactly(length)

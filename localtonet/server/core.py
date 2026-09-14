@@ -44,6 +44,7 @@ from localtonet.core.limiter import ClientRateLimiter
 from localtonet.core.pipe import close_write_side, close_writer, pipe_both
 from localtonet.core.rules import parse_mapping, parse_ports
 from localtonet.core.runtime import cancel_all, peer_name, spawn
+from localtonet.core.tls import build_server_context, describe_server_tls
 from localtonet.errors import AuthError, QuotaExceededError, TunnelError
 from localtonet.server.auth import Authenticator, build_authenticator
 from localtonet.server.mapping import (
@@ -55,7 +56,7 @@ from localtonet.server.mapping import (
 from localtonet.server.pending import PendingConn, PendingTable
 from localtonet.server.registry import ClientRegistry, ClientSession
 from logging_setup import get_logger
-from protocol import MsgType, ProtocolError, make_msg, recv_msg, send_msg
+from protocol import FrameLengthError, MsgType, ProtocolError, make_msg, recv_msg, send_msg
 
 __all__ = ["TunnelServer", "ServerStats"]
 
@@ -122,6 +123,10 @@ class TunnelServer:
         self._log = logger or get_logger("server")
         self._events = events or EventBus(self._log)
         self._auth = authenticator or build_authenticator(config.auth)
+        # TLS 上下文在这里建一次、全程复用。绝不放到连接路径上现建——
+        # 数据通道是"每个请求一条 TCP"，每条都新建 context 会让 TLS 1.3 的
+        # 会话票据缓存彻底失效，等于每个请求都付一次完整握手。
+        self._tls = build_server_context(config.tls, logger=self._log)
         self._registry = registry or ClientRegistry(logger=self._log)
         self._pending = PendingTable(logger=self._log)
         self._limiter = self._build_limiter(config.limits)
@@ -155,15 +160,30 @@ class TunnelServer:
 
     async def start(self) -> None:
         cfg = self._config
-        self._log.info("启动服务端 %s（鉴权：%s）", cfg.name, self._auth.name)
+        self._log.info(
+            "启动服务端 %s（鉴权：%s，传输：%s）",
+            cfg.name,
+            self._auth.name,
+            describe_server_tls(cfg.tls),
+        )
 
         await self._mapping.start(cfg.mapping)
 
+        # ssl_handshake_timeout 只在挂了 ssl 时才允许传，所以参数得动态拼。
+        # 显式收紧它是必要的：默认 60s 会让"明文客户端打 TLS 端口"这类必然失败
+        # 的握手白占连接一分钟，测试收尾会明显变慢。
+        tls_kwargs: Dict[str, Any] = {}
+        if self._tls is not None:
+            tls_kwargs["ssl"] = self._tls
+            tls_kwargs["ssl_handshake_timeout"] = cfg.tls.handshake_timeout
+
         try:
             self._control_server = await asyncio.start_server(
-                self._handle_control, cfg.control.host, cfg.control.port
+                self._handle_control, cfg.control.host, cfg.control.port, **tls_kwargs
             )
-            self._data_server = await asyncio.start_server(self._handle_data, cfg.data.host, cfg.data.port)
+            self._data_server = await asyncio.start_server(
+                self._handle_data, cfg.data.host, cfg.data.port, **tls_kwargs
+            )
         except OSError as exc:
             await self._mapping.stop()
             raise TunnelError(f"控制/数据通道监听失败：{exc}") from exc
@@ -269,6 +289,26 @@ class TunnelServer:
     # 控制通道
     # ------------------------------------------------------------------ #
 
+    def _explain_frame_length_error(self, exc: ProtocolError, peer: str) -> None:
+        """给"长度头非法"补一条能直接定位的提示。
+
+        不新增协议字段的前提下，"客户端配了 TLS 而服务端是明文"（或反之）
+        唯一的症状就是帧长度头被解析成一个天文数字然后被拒——行为是对的（fail fast），
+        但日志只说"长度非法"，运维得自己想到加密方式不匹配这一层。
+        TLS 记录头（``16 03 …``）被当成大端长度必然越界，所以这个信号是可靠的。
+        """
+        if self._tls is not None:
+            # 本端已经开了 TLS，说明对端要么证书不对（握手阶段就失败了）、
+            # 要么根本不是 TLS 连接；与"本端明文"是两回事，不套用这条提示
+            return
+        if not isinstance(exc, FrameLengthError):
+            return
+        self._log.warning(
+            "提示：控制连接 %s 的长度头非法，常见原因是**客户端配置了 TLS 而本端是明文**"
+            "（TLS 记录头被当成了帧长度头）。请核对两端的 tls 配置是否一致",
+            peer,
+        )
+
     async def _handle_control(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = peer_name(writer)
         session: Optional[ClientSession] = None
@@ -282,6 +322,7 @@ class TunnelServer:
                 return
             except ProtocolError as exc:
                 self._log.warning("控制连接 %s 读取出错：%s", peer, exc)
+                self._explain_frame_length_error(exc, peer)
                 return
 
             if first.get("type") != MsgType.REGISTER_CLIENT:

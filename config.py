@@ -33,6 +33,8 @@ __all__ = [
     "AuthConfig",
     "LimitsConfig",
     "MappingStoreConfig",
+    "ServerTlsConfig",
+    "ClientTlsConfig",
     "LogConfig",
     "ServerConfig",
     "ClientConfig",
@@ -72,6 +74,24 @@ def _as_bool(value: Any, where: str) -> bool:
     if not isinstance(value, bool):
         raise ConfigError(f"{where} 必须是布尔值，实际为 {type(value).__name__}")
     return value
+
+
+_ENV_TRUE = ("1", "true", "yes", "on")
+_ENV_FALSE = ("0", "false", "no", "off")
+
+
+def _as_env_bool(value: str, where: str) -> bool:
+    """解析环境变量里的布尔值。
+
+    环境变量天生是字符串，``bool("false") is True`` 这种坑必须先在这里拦死，
+    否则 ``LOCALTONET_TLS_ENABLED=false`` 会**打开** TLS。
+    """
+    text = value.strip().lower()
+    if text in _ENV_TRUE:
+        return True
+    if text in _ENV_FALSE:
+        return False
+    raise ConfigError(f"{where} 只接受 {_ENV_TRUE + _ENV_FALSE} 之一，实际为 {value!r}")
 
 
 def _check_unknown(data: Mapping[str, Any], allowed: Tuple[str, ...], where: str) -> None:
@@ -337,6 +357,117 @@ class MappingStoreConfig:
 
 
 @dataclass
+class ServerTlsConfig:
+    """服务端 TLS。**默认完全关闭**——不配就是明文，与 TLS 落地前行为一致。
+
+    为什么两端的 TLS 配置是**两个类**而不是共用一个：两端需要的材料根本不同。
+    服务端持有私钥、可能要求客户端出示证书（``require_client_cert`` + ``client_ca``）；
+    客户端持有可信 CA、可能持有自己的客户端证书。塞进一个类就得靠"哪些字段在哪端生效"
+    的口头约定，而 `_check_unknown` 的 fail fast 会因此失效。
+
+    ``enabled`` 与 ``cert``/``key`` 的关系沿用 ``mapping_store`` 的既有先例：
+    **JSON 里要求显式写 ``enabled``**（配置文件讲究所见即所得），
+    而命令行与环境变量这两层只要给出证书路径就**隐式开启**——
+    覆盖层的存在意义就是"临时改一处"，别让人填了三个路径还漏掉一个开关。
+    """
+
+    enabled: bool = False
+    cert: str = ""
+    """证书链文件路径（PEM，服务端证书在前）。"""
+    key: str = ""
+    """私钥文件路径（PEM）。"""
+    require_client_cert: bool = False
+    """是否要求客户端出示证书（双向认证 mTLS）。
+
+    应用层已有共享令牌做身份校验，mTLS 是**纵深防御**而非必需品：
+    开启后客户端证书必须由 ``client_ca`` 签发，否则在 TLS 握手阶段就被拒。
+    """
+    client_ca: str = ""
+    """校验客户端证书用的 CA 路径，仅 ``require_client_cert=True`` 时生效。"""
+    handshake_timeout: float = 10.0
+    """TLS 握手超时秒数。默认 60s 会让"明文客户端打 TLS 端口"这类失败白占连接，
+    直接拖慢测试收尾，因此显式收紧。"""
+
+    _FIELDS = ("enabled", "cert", "key", "require_client_cert", "client_ca", "handshake_timeout")
+
+    @classmethod
+    def from_dict(cls, data: Optional[Mapping[str, Any]]) -> "ServerTlsConfig":
+        if data is None:
+            return cls()
+        _check_unknown(data, cls._FIELDS, "tls")
+        return cls(
+            enabled=_as_bool(data.get("enabled", False), "tls.enabled"),
+            cert=_as_str(data.get("cert", ""), "tls.cert"),
+            key=_as_str(data.get("key", ""), "tls.key"),
+            require_client_cert=_as_bool(data.get("require_client_cert", False), "tls.require_client_cert"),
+            client_ca=_as_str(data.get("client_ca", ""), "tls.client_ca"),
+            handshake_timeout=_as_float(data.get("handshake_timeout", 10.0), "tls.handshake_timeout"),
+        )
+
+    def validate(self) -> None:
+        if self.handshake_timeout <= 0:
+            raise ConfigError("tls.handshake_timeout 必须为正数")
+        if not self.enabled:
+            return
+        if not self.cert or not self.key:
+            raise ConfigError("tls.enabled 为 true 时必须同时提供 tls.cert 与 tls.key")
+        if self.require_client_cert and not self.client_ca:
+            raise ConfigError(
+                "tls.require_client_cert 为 true 时必须提供 tls.client_ca，否则无法校验客户端证书"
+            )
+        if self.client_ca and not self.require_client_cert:
+            raise ConfigError(
+                "提供了 tls.client_ca 但 tls.require_client_cert 为 false——"
+                "要么打开双向认证，要么删掉 client_ca，别让它静默失效"
+            )
+
+
+@dataclass
+class ClientTlsConfig:
+    """客户端 TLS。**默认完全关闭**——不配就是明文。
+
+    ``ca`` 留空表示使用**系统信任库**（适合目标服务端持有公网证书的场景）；
+    自签 CA 必须显式给出 ``ca``，否则校验会失败——这是刻意的，不做静默降级。
+    """
+
+    enabled: bool = False
+    ca: str = ""
+    """可信 CA 文件路径；留空则使用系统信任库。"""
+    cert: str = ""
+    """客户端证书路径，仅服务端开启双向认证时需要。"""
+    key: str = ""
+    """客户端私钥路径。"""
+    check_hostname: bool = True
+    """是否校验服务端证书里的主机名。关掉它仍然校验证书链，只放过主机名。"""
+    skip_verify: bool = False
+    """**调试专用**：完全跳过证书链与主机名校验，**优先级高于 ``check_hostname``**。
+
+    开启后会记一条 WARNING。默认关，且必须显式配置才生效——
+    绝不允许"证书校验失败就自动降级到这里"。
+    """
+
+    _FIELDS = ("enabled", "ca", "cert", "key", "check_hostname", "skip_verify")
+
+    @classmethod
+    def from_dict(cls, data: Optional[Mapping[str, Any]]) -> "ClientTlsConfig":
+        if data is None:
+            return cls()
+        _check_unknown(data, cls._FIELDS, "tls")
+        return cls(
+            enabled=_as_bool(data.get("enabled", False), "tls.enabled"),
+            ca=_as_str(data.get("ca", ""), "tls.ca"),
+            cert=_as_str(data.get("cert", ""), "tls.cert"),
+            key=_as_str(data.get("key", ""), "tls.key"),
+            check_hostname=_as_bool(data.get("check_hostname", True), "tls.check_hostname"),
+            skip_verify=_as_bool(data.get("skip_verify", False), "tls.skip_verify"),
+        )
+
+    def validate(self) -> None:
+        if bool(self.cert) != bool(self.key):
+            raise ConfigError("tls.cert 与 tls.key 必须成对提供（服务端要求双向认证时用）")
+
+
+@dataclass
 class LogConfig:
     level: str = "INFO"
     file: str = ""
@@ -381,6 +512,8 @@ class ServerConfig:
     reconnect: ReconnectPolicy = field(default_factory=ReconnectPolicy)
     auth: AuthConfig = field(default_factory=AuthConfig)
     limits: LimitsConfig = field(default_factory=LimitsConfig)
+    tls: ServerTlsConfig = field(default_factory=ServerTlsConfig)
+    """控制通道与数据通道的传输加密。默认关闭＝明文，与 TLS 落地前完全一致。"""
     log: LogConfig = field(default_factory=LogConfig)
 
     _FIELDS = (
@@ -394,6 +527,7 @@ class ServerConfig:
         "reconnect",
         "auth",
         "limits",
+        "tls",
         "log",
     )
 
@@ -420,6 +554,7 @@ class ServerConfig:
             reconnect=ReconnectPolicy.from_dict(data.get("reconnect")),
             auth=AuthConfig.from_dict(data.get("auth")),
             limits=LimitsConfig.from_dict(data.get("limits")),
+            tls=ServerTlsConfig.from_dict(data.get("tls")),
             log=LogConfig.from_dict(data.get("log")),
         )
         cfg.validate()
@@ -451,6 +586,25 @@ class ServerConfig:
             cfg.mapping_store.type = env["mapping_store"].strip().lower()
         if "mapping_store_path" in env:
             cfg.mapping_store.path = env["mapping_store_path"]
+        # TLS：给出证书路径即隐式开启，避免"路径都填了却漏了开关"（与 --mapping-store-path 同理）
+        if "tls_cert" in env:
+            cfg.tls.cert = env["tls_cert"]
+            cfg.tls.enabled = True
+        if "tls_key" in env:
+            cfg.tls.key = env["tls_key"]
+            cfg.tls.enabled = True
+        if "tls_client_ca" in env:
+            cfg.tls.client_ca = env["tls_client_ca"]
+        if "tls_require_client_cert" in env:
+            cfg.tls.require_client_cert = _as_env_bool(
+                env["tls_require_client_cert"], "LOCALTONET_TLS_REQUIRE_CLIENT_CERT"
+            )
+        if "tls_enabled" in env:
+            cfg.tls.enabled = _as_env_bool(env["tls_enabled"], "LOCALTONET_TLS_ENABLED")
+        if "tls_handshake_timeout" in env:
+            cfg.tls.handshake_timeout = _as_float(
+                env["tls_handshake_timeout"], "LOCALTONET_TLS_HANDSHAKE_TIMEOUT"
+            )
         if "log_level" in env:
             cfg.log.level = env["log_level"].upper()
         cfg.validate()
@@ -482,6 +636,7 @@ class ServerConfig:
         self.auth.validate()
         self.mapping_store.validate()
         self.limits.validate()
+        self.tls.validate()
         self.log.validate()
 
     def public_ports(self) -> List[int]:
@@ -517,6 +672,8 @@ class ClientConfig:
     reconnect: ReconnectPolicy = field(default_factory=ReconnectPolicy)
     auth_token: str = ""
     limits: LimitsConfig = field(default_factory=LimitsConfig)
+    tls: ClientTlsConfig = field(default_factory=ClientTlsConfig)
+    """控制通道与数据通道的传输加密。默认关闭＝明文。"""
     log: LogConfig = field(default_factory=LogConfig)
 
     _FIELDS = (
@@ -530,6 +687,7 @@ class ClientConfig:
         "reconnect",
         "auth_token",
         "limits",
+        "tls",
         "log",
     )
 
@@ -556,6 +714,7 @@ class ClientConfig:
             reconnect=ReconnectPolicy.from_dict(data.get("reconnect")),
             auth_token=_as_str(data.get("auth_token", ""), "auth_token"),
             limits=LimitsConfig.from_dict(data.get("limits")),
+            tls=ClientTlsConfig.from_dict(data.get("tls")),
             log=LogConfig.from_dict(data.get("log")),
         )
         cfg.validate()
@@ -584,6 +743,22 @@ class ClientConfig:
             ]
         if "auth_token" in env:
             cfg.auth_token = env["auth_token"]
+        # TLS：给出 ca / 客户端证书即隐式开启，与 --mapping-store-path 隐式切 file 同理
+        if "tls_ca" in env:
+            cfg.tls.ca = env["tls_ca"]
+            cfg.tls.enabled = True
+        if "tls_cert" in env:
+            cfg.tls.cert = env["tls_cert"]
+            cfg.tls.enabled = True
+        if "tls_key" in env:
+            cfg.tls.key = env["tls_key"]
+            cfg.tls.enabled = True
+        if "tls_enabled" in env:
+            cfg.tls.enabled = _as_env_bool(env["tls_enabled"], "LOCALTONET_TLS_ENABLED")
+        if "tls_check_hostname" in env:
+            cfg.tls.check_hostname = _as_env_bool(env["tls_check_hostname"], "LOCALTONET_TLS_CHECK_HOSTNAME")
+        if "tls_skip_verify" in env:
+            cfg.tls.skip_verify = _as_env_bool(env["tls_skip_verify"], "LOCALTONET_TLS_SKIP_VERIFY")
         if "log_level" in env:
             cfg.log.level = env["log_level"].upper()
         cfg.validate()
@@ -605,6 +780,7 @@ class ClientConfig:
         self.timeouts.validate()
         self.reconnect.validate()
         self.limits.validate()
+        self.tls.validate()
         self.log.validate()
 
     def to_dict(self) -> Dict[str, Any]:

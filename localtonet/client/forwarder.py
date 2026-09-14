@@ -11,6 +11,9 @@ localtonet.client.forwarder —— 数据通道与内网后端
 还能省掉一次无意义的往返。客户端随后通过控制通道上报 ``conn_error``，
 服务端据此立刻给访客回 502，而不是让访客一直等到配对超时。
 
+**两条连接、两种加密**：数据通道过公网，跟着 ``tls`` 配置走；
+连内网后端那一跳只走本机/内网，**永远明文**。别"顺手"给后者也套上 TLS。
+
 **扩展点**：限速/限额的挂载点是 ``pipe_both`` 内部的写入循环，
 本模块只负责建立连接与收尾，不掺业务策略。
 """
@@ -19,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ssl
 import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
@@ -74,10 +78,18 @@ class DataChannelForwarder:
         connect_timeout: float,
         logger: Optional[logging.Logger] = None,
         events: Optional[EventBus] = None,
+        tls: Optional[ssl.SSLContext] = None,
     ) -> None:
         self._server_host = server_host
         self._data_port = data_port
         self._local_host = local_host
+        self._tls = tls
+        """数据通道的 TLS 上下文，``None`` 表示明文。
+
+        **只作用于"客户端 → 服务端"这一跳**。下面连内网后端的那一跳走的是
+        本机/内网，不加任何加密——给内网那一跳套 TLS 是纯粹的自我感动，
+        还会把"后端是明文 HTTP"这个绝大多数场景直接堵死。
+        """
         self._connect_timeout = connect_timeout
         self._log = logger or get_logger("client.forwarder")
         self._events = events or EventBus(self._log)
@@ -106,10 +118,10 @@ class DataChannelForwarder:
                 await report_error(conn_id, reason)
                 return self._fail(conn_id, local_port, reason, started)
 
-            # ② 再开数据通道并注册
+            # ② 再开数据通道并注册（这一跳要过公网，跟着 tls 配置走）
             try:
                 data_reader, data_writer = await asyncio.wait_for(
-                    asyncio.open_connection(self._server_host, self._data_port),
+                    asyncio.open_connection(self._server_host, self._data_port, ssl=self._tls),
                     timeout=self._connect_timeout,
                 )
             except (OSError, TimeoutError) as exc:

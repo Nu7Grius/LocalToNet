@@ -88,6 +88,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="强制关闭鉴权，覆盖配置文件与环境变量里的设置（本地演示用）",
     )
+    tls_group = parser.add_mutually_exclusive_group()
+    tls_group.add_argument(
+        "--tls-cert",
+        metavar="路径",
+        help="开启 TLS 并指定证书链（PEM）。与 --tls-key 配套，给出即隐式开启 TLS",
+    )
+    tls_group.add_argument(
+        "--no-tls",
+        action="store_true",
+        help="强制关闭 TLS，覆盖配置文件与环境变量里的设置（本地演示用）",
+    )
+    parser.add_argument("--tls-key", metavar="路径", help="TLS 私钥（PEM），与 --tls-cert 配套")
+    parser.add_argument(
+        "--tls-client-ca",
+        metavar="路径",
+        help="校验客户端证书用的 CA；给出即要求客户端出示证书（双向认证 mTLS）",
+    )
     parser.add_argument("--log-level", help="日志级别（DEBUG/INFO/WARNING/ERROR）")
     parser.add_argument("--log-file", help="同时写入日志文件")
     return parser
@@ -132,6 +149,27 @@ def load_config(args: argparse.Namespace) -> ServerConfig:
             raise ConfigError("--token 不能为空；若要关闭鉴权请改用 --no-auth")
         config.auth.token = token
         config.auth.enabled = True
+    # TLS：命令行优先级最高。--no-tls 是逃生门；--tls-cert/--tls-key 给出即隐式开启
+    # （与 --mapping-store-path 隐式切 file 同理，避免"路径都填了却漏了开关"）。
+    # 这些参数的 default 必须是 None，否则无法区分"没给"和"给了空串"。
+    if args.no_tls:
+        config.tls.enabled = False
+    if args.tls_cert is not None:
+        if not args.tls_cert.strip():
+            raise ConfigError("--tls-cert 不能为空；若要关闭 TLS 请改用 --no-tls")
+        config.tls.cert = args.tls_cert
+        config.tls.enabled = True
+    if args.tls_key is not None:
+        if not args.tls_key.strip():
+            raise ConfigError("--tls-key 不能为空")
+        config.tls.key = args.tls_key
+        config.tls.enabled = True
+    if args.tls_client_ca is not None:
+        if not args.tls_client_ca.strip():
+            raise ConfigError("--tls-client-ca 不能为空")
+        config.tls.client_ca = args.tls_client_ca
+        config.tls.require_client_cert = True
+        config.tls.enabled = True
     if args.log_level:
         config.log.level = args.log_level.upper()
     if args.log_file:

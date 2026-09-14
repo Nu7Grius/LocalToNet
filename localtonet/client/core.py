@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
+import ssl
 import time
 import uuid
 from dataclasses import dataclass
@@ -42,6 +43,7 @@ from localtonet.core.events import EventBus, EventType
 from localtonet.core.heartbeat import HeartbeatTask
 from localtonet.core.pipe import close_writer
 from localtonet.core.runtime import cancel_all, spawn
+from localtonet.core.tls import build_client_context, describe_client_tls
 from localtonet.errors import RegistrationError, TunnelError
 from logging_setup import get_logger
 from protocol import MsgType, ProtocolError, make_msg, recv_msg, send_msg
@@ -97,6 +99,9 @@ class TunnelClient:
         self._events = events or EventBus(self._log)
         self._dispatcher = MessageDispatcher.from_object(self, logger=self._log)
         self._backoff = Backoff(config.reconnect)
+        # 建一次、全程复用：数据通道是"每个请求一条 TCP"，
+        # 每条连接现建上下文会让 TLS 1.3 的会话复用彻底失效。
+        self._tls = build_client_context(config.tls, logger=self._log)
 
         self._client_id = config.client_id or generate_client_id()
         self._control_writer: Optional[asyncio.StreamWriter] = None
@@ -184,10 +189,11 @@ class TunnelClient:
         """主循环：连上 → 服务 → 断了退避重连，直到 :meth:`stop` 被调用。"""
         self._running = True
         self._log.info(
-            "客户端 %s 启动，目标 %s:%d，认领本地端口 %s",
+            "客户端 %s 启动，目标 %s:%d（%s），认领本地端口 %s",
             self._client_id,
             self._config.server_host,
             self._config.control_port,
+            describe_client_tls(self._config.tls),
             self._config.local_ports,
         )
 
@@ -207,9 +213,48 @@ class TunnelClient:
                     self._events.emit(EventType.CONTROL_LOST, reason=str(exc), fatal=True)
                     return
                 reason = f"注册失败：{exc}"
+            except ssl.SSLError as exc:
+                # TLS 握手失败 = **永久性失败**，与 403 同一套哲学。
+                # 证书不被信任、主机名不匹配、对端根本不是 TLS、客户端证书没被接受——
+                # 这些全是配置错，重试一万次结果一样，每 60s 撞一次墙只会刷满日志。
+                #
+                # ⚠️ 这个分支必须排在 (OSError, TimeoutError) 之前：
+                # ssl.SSLError 是 OSError 的子类，顺序反了这段逻辑永远不会执行。
+                self._state = "stopped"
+                self._fatal = True
+                reason = f"TLS 握手失败：{exc}"
+                self._log.error("%s，停止重试（请核对两端的 tls 配置）", reason)
+                self._events.emit(EventType.CONTROL_LOST, reason=reason, fatal=True)
+                return
             except (OSError, TimeoutError) as exc:
+                if self._tls is not None and isinstance(exc, ConnectionResetError):
+                    # 本端配了 TLS，对端却在握手/首个数据交换时直接重置连接（RST）。
+                    # 与 ConnectionRefusedError（对端没监听）不同：RST 说明对端**在**，
+                    # 但要么不是 TLS、要么证书被拒后粗暴断连——重试没有意义。
+                    # Windows 上 TLS 客户端打明文服务端常表现为空消息的
+                    # ConnectionResetError，而不是 ssl.SSLError，所以这里单独判。
+                    self._state = "stopped"
+                    self._fatal = True
+                    reason = f"TLS 连接被对端重置：{exc}"
+                    self._log.error("%s，停止重试（请核对两端 tls 配置）", reason)
+                    self._events.emit(EventType.CONTROL_LOST, reason=reason, fatal=True)
+                    return
                 reason = f"连接服务端失败：{exc}"
             except ProtocolError as exc:
+                if self._tls is not None and self._is_tls_plaintext_mismatch(exc):
+                    # 本端配了 TLS，却在读长度头时被对端立刻关断——对端几乎可以确定是**明文**。
+                    # 这同样是"配置错、重试无用"：客户端拿 TLS 去撞明文服务端，
+                    # 服务端把 ClientHello 当帧长度头解析失败后主动断开，客户端根本进不了
+                    # 握手阶段，所以这里报的是 ProtocolError 而不是 ssl.SSLError。
+                    self._state = "stopped"
+                    self._fatal = True
+                    reason = f"TLS 配置不匹配：{exc}"
+                    self._log.error(
+                        "%s，停止重试（本端开了 TLS 但服务端像明文；请核对两端 tls 配置）",
+                        reason,
+                    )
+                    self._events.emit(EventType.CONTROL_LOST, reason=reason, fatal=True)
+                    return
                 reason = f"控制通道协议错误：{exc}"
             except TunnelError as exc:
                 reason = f"客户端错误：{exc}"
@@ -264,13 +309,18 @@ class TunnelClient:
         self._last_error = ""
 
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(cfg.server_host, cfg.control_port),
+            asyncio.open_connection(cfg.server_host, cfg.control_port, ssl=self._tls),
             timeout=cfg.timeouts.connect_timeout,
         )
         self._control_writer = writer
         self._backoff.reset()
         self._state = "online"
-        self._log.info("已连上控制通道 %s:%d", cfg.server_host, cfg.control_port)
+        self._log.info(
+            "已连上控制通道 %s:%d（%s）",
+            cfg.server_host,
+            cfg.control_port,
+            "TLS" if self._tls is not None else "明文",
+        )
         self._events.emit(EventType.CONTROL_CONNECTED, host=cfg.server_host, port=cfg.control_port)
 
         hb_task: Optional[asyncio.Task] = None
@@ -359,6 +409,17 @@ class TunnelClient:
             data_port=self._data_port,
         )
 
+    @staticmethod
+    def _is_tls_plaintext_mismatch(exc: ProtocolError) -> bool:
+        """判断这个协议错误是不是"本端 TLS、对端明文"的错配。
+
+        信号是"读长度头阶段就被关断"——明文对端把 TLS 的 ClientHello 当成帧长度头
+        解析，长度越界后被拒并断开，本端连一个完整帧都读不到。普通断网也会表现为
+        读不到长度头，所以这里**只在配了 TLS 时才**往错配方向判；纯明文两端之间
+        的网络抖动仍然走退避重试，行为不变。
+        """
+        return "读取长度头" in str(exc)
+
     async def _sleep_or_stop(self, delay: float) -> bool:
         """等待重连延迟；若期间收到 stop 则返回 True。"""
         try:
@@ -397,6 +458,7 @@ class TunnelClient:
             connect_timeout=self._config.timeouts.connect_timeout,
             logger=self._log,
             events=self._events,
+            tls=self._tls,
         )
         spawn(
             self._run_forward(forwarder, conn_id, local_port),

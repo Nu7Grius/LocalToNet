@@ -73,6 +73,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--local-host", help="内网后端地址（默认 127.0.0.1）")
     parser.add_argument("--local-ports", type=parse_ports, metavar="端口,...", help="要认领的本机端口，逗号或空格分隔")
     parser.add_argument("--token", help="服务端开启鉴权时的访问令牌")
+    tls_group = parser.add_mutually_exclusive_group()
+    tls_group.add_argument(
+        "--tls-ca",
+        metavar="路径",
+        help="开启 TLS 并指定可信 CA（PEM，服务端是自签证书时必填）。留空则用系统信任库",
+    )
+    tls_group.add_argument(
+        "--no-tls",
+        action="store_true",
+        help="强制关闭 TLS，覆盖配置文件与环境变量里的设置（本地演示用）",
+    )
+    parser.add_argument("--tls-cert", metavar="路径", help="客户端证书（PEM），服务端要求双向认证时用")
+    parser.add_argument("--tls-key", metavar="路径", help="客户端私钥（PEM），与 --tls-cert 配套")
+    parser.add_argument(
+        "--tls-skip-verify",
+        action="store_true",
+        help="跳过 TLS 证书校验（仅调试用，绝不可用于生产）",
+    )
     parser.add_argument("--log-level", help="日志级别（DEBUG/INFO/WARNING/ERROR）")
     parser.add_argument("--log-file", help="同时写入日志文件")
     return parser
@@ -102,6 +120,22 @@ def load_config(args: argparse.Namespace) -> ClientConfig:
         config.local_ports = list(args.local_ports)
     if args.token:
         config.auth_token = args.token
+    # TLS：--no-tls 是逃生门；--tls-ca 给出即隐式开启（default=None，避免空串让判断恒真）。
+    if args.no_tls:
+        config.tls.enabled = False
+    if args.tls_ca is not None:
+        config.tls.ca = args.tls_ca
+        config.tls.enabled = True
+    if args.tls_cert:
+        config.tls.cert = args.tls_cert
+        config.tls.enabled = True
+    if args.tls_key:
+        config.tls.key = args.tls_key
+        config.tls.enabled = True
+    if args.tls_skip_verify:
+        config.tls.skip_verify = True
+        config.tls.check_hostname = False
+        config.tls.enabled = True
     if args.log_level:
         config.log.level = args.log_level.upper()
     if args.log_file:

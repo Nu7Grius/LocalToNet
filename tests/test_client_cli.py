@@ -156,3 +156,45 @@ def test_rejection_message_carries_no_duplicated_code_prefix() -> None:
     proc = asyncio.run(scenario())
     for stream, text in (("stdout", proc.stdout), ("stderr", proc.stderr)):
         assert text.count("[403]") <= 1, f"{stream} 里出现了叠字前缀：{text!r}"
+
+
+def test_tls_client_against_plaintext_server_exits_with_code_1() -> None:
+    """客户端配了 TLS 却连明文服务端 → 永久失败，退出码 1（不是无限退避重试）。
+
+    这是 TLS 落地新增的一条退出码契约：TLS 错配与 403 同类，都是"配置错、重试无用"。
+    """
+    certs = REPO_ROOT / "tests" / "certs"
+
+    async def scenario() -> subprocess.CompletedProcess[str]:
+        port = free_ports(1)[0]
+        # 明文假服务端：只读一条就关，不解析 TLS
+        async def plain_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            try:
+                await asyncio.wait_for(reader.read(100), timeout=1)
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                with contextlib.suppress(Exception):
+                    writer.close()
+
+        server = await asyncio.start_server(plain_handler, "127.0.0.1", port)
+        try:
+            return await asyncio.to_thread(
+                run_client,
+                [
+                    "--server",
+                    f"127.0.0.1:{port}",
+                    "--local-ports",
+                    "8000",
+                    "--tls-ca",
+                    str(certs / "ca.pem"),
+                ],
+                timeout=30.0,
+            )
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    proc = asyncio.run(scenario())
+
+    assert proc.returncode == 1, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"

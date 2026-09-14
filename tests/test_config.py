@@ -13,12 +13,14 @@ import pytest
 
 from config import (
     ClientConfig,
+    ClientTlsConfig,
     ConfigError,
     LimitsConfig,
     LogConfig,
     MappingRule,
     MappingStoreConfig,
     ServerConfig,
+    ServerTlsConfig,
     Timeouts,
 )
 from localtonet.errors import TunnelError
@@ -284,3 +286,57 @@ def test_demo_config_keeps_memory_store() -> None:
     """演示配置不能被悄悄切成持久化——那会改变"改配置就生效"的既有直觉。"""
     cfg = ServerConfig.from_file(ROOT / "config.json")
     assert cfg.mapping_store.type == "memory"
+
+
+# --------------------------------------------------------------------------- #
+# TLS 配置
+# --------------------------------------------------------------------------- #
+
+
+def test_tls_defaults_to_disabled() -> None:
+    assert ServerTlsConfig().enabled is False
+    assert ClientTlsConfig().enabled is False
+
+
+def test_server_tls_requires_cert_and_key_when_enabled() -> None:
+    with pytest.raises(ConfigError, match="cert"):
+        ServerTlsConfig(enabled=True).validate()
+
+
+def test_server_tls_mtls_requires_client_ca() -> None:
+    with pytest.raises(ConfigError, match="client_ca"):
+        ServerTlsConfig(enabled=True, cert="c.pem", key="k.pem", require_client_cert=True).validate()
+
+
+def test_server_tls_client_ca_without_mtls_is_rejected() -> None:
+    """给了 client_ca 却没开双向认证——要么打开，要么删掉，别让它静默失效。"""
+    with pytest.raises(ConfigError, match="require_client_cert"):
+        ServerTlsConfig(enabled=True, cert="c.pem", key="k.pem", client_ca="ca.pem").validate()
+
+
+def test_client_tls_cert_key_must_be_paired() -> None:
+    with pytest.raises(ConfigError, match="成对"):
+        ClientTlsConfig(enabled=True, ca="ca.pem", cert="c.pem").validate()
+
+
+def test_client_tls_skip_verify_requires_explicit_enabled() -> None:
+    """skip_verify 是逃生门：默认关，且必须显式 enabled 才进入 TLS 路径。"""
+    # 单独给 skip_verify 但没 enabled，仍是明文（不创建上下文）
+    assert ClientTlsConfig(skip_verify=True).enabled is False
+
+
+def test_tls_unknown_field_is_rejected() -> None:
+    with pytest.raises(ConfigError, match="未知字段"):
+        ServerTlsConfig.from_dict({"enabled": True, "cert": "c.pem", "key": "k.pem", "verify": False})
+
+
+def test_server_config_roundtrip_keeps_tls() -> None:
+    cfg = ServerConfig.from_file(ROOT / "config.json")
+    cfg.tls = ServerTlsConfig(enabled=True, cert="c.pem", key="k.pem")
+    assert ServerConfig.from_dict(cfg.to_dict()).tls.enabled is True
+
+
+def test_demo_config_keeps_tls_disabled() -> None:
+    """演示配置不能悄悄开 TLS——那会让本地 demo 突然要证书。"""
+    cfg = ServerConfig.from_file(ROOT / "config.json")
+    assert cfg.tls.enabled is False

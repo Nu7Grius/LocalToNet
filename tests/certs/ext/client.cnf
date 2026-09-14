@@ -1,0 +1,4 @@
+[v3_client]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = clientAuth

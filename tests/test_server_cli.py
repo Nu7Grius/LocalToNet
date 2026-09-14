@@ -34,6 +34,11 @@ _ENV_KEYS = (
     "LOCALTONET_AUTH_TOKEN",
     "LOCALTONET_MAPPING_STORE",
     "LOCALTONET_MAPPING_STORE_PATH",
+    "LOCALTONET_TLS_CERT",
+    "LOCALTONET_TLS_KEY",
+    "LOCALTONET_TLS_CLIENT_CA",
+    "LOCALTONET_TLS_REQUIRE_CLIENT_CERT",
+    "LOCALTONET_TLS_ENABLED",
     "LOCALTONET_LOG_LEVEL",
 )
 
@@ -205,3 +210,61 @@ def test_file_mode_without_path_exits_with_code_2(
 
     assert code == 2
     assert "mapping_store.path" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# TLS
+# --------------------------------------------------------------------------- #
+
+
+def test_cli_tls_cert_and_key_turn_tls_on(tmp_path: Path) -> None:
+    path = write_server_config(tmp_path)
+    config = load_config(parse(["-c", str(path), "--tls-cert", "c.pem", "--tls-key", "k.pem"]))
+
+    assert config.tls.enabled is True
+    assert config.tls.cert == "c.pem"
+    assert config.tls.key == "k.pem"
+
+
+def test_cli_tls_client_ca_implies_mtls(tmp_path: Path) -> None:
+    path = write_server_config(tmp_path)
+    config = load_config(
+        parse(["-c", str(path), "--tls-cert", "c.pem", "--tls-key", "k.pem", "--tls-client-ca", "ca.pem"])
+    )
+
+    assert config.tls.require_client_cert is True
+    assert config.tls.client_ca == "ca.pem"
+
+
+def test_cli_no_tls_overrides_json_tls(tmp_path: Path) -> None:
+    """``--no-tls`` 是本地演示逃生门：JSON 里开着 TLS 也能关掉。"""
+    payload = {
+        "name": "cli-test",
+        "control": {"host": "127.0.0.1", "port": 7000},
+        "data": {"host": "127.0.0.1", "port": 7001},
+        "mapping": [{"public_port": 9028, "local_port": 8000}],
+        "tls": {"enabled": True, "cert": "c.pem", "key": "k.pem"},
+    }
+    path = tmp_path / "server.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    config = load_config(parse(["-c", str(path), "--no-tls"]))
+
+    assert config.tls.enabled is False
+
+
+def test_cli_without_tls_keeps_json_tls(tmp_path: Path) -> None:
+    """不给命令行 TLS 参数时，JSON 里的 TLS 设置必须原样保留。"""
+    payload = {
+        "name": "cli-test",
+        "control": {"host": "127.0.0.1", "port": 7000},
+        "data": {"host": "127.0.0.1", "port": 7001},
+        "mapping": [{"public_port": 9028, "local_port": 8000}],
+        "tls": {"enabled": True, "cert": "c.pem", "key": "k.pem"},
+    }
+    path = tmp_path / "server.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    config = load_config(parse(["-c", str(path)]))
+
+    assert config.tls.enabled is True
