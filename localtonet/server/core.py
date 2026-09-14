@@ -29,22 +29,29 @@ TCP 上，大文件传输时的写缓冲堆积会把指令堵在后面，表现�
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from config import ConfigError, ServerConfig
+from config import ConfigError, LimitsConfig, ServerConfig
 from localtonet.core.dispatcher import MessageDispatcher, handler
 from localtonet.core.events import EventBus, EventType
 from localtonet.core.heartbeat import Watchdog
-from localtonet.core.pipe import close_writer, pipe_both
+from localtonet.core.limiter import ClientRateLimiter
+from localtonet.core.pipe import close_write_side, close_writer, pipe_both
 from localtonet.core.rules import parse_mapping, parse_ports
 from localtonet.core.runtime import cancel_all, peer_name, spawn
-from localtonet.errors import AuthError, TunnelError
+from localtonet.errors import AuthError, QuotaExceededError, TunnelError
 from localtonet.server.auth import Authenticator, build_authenticator
-from localtonet.server.mapping import InMemoryMappingStore, MappingDiff, MappingManager, MappingStore
+from localtonet.server.mapping import (
+    MappingDiff,
+    MappingManager,
+    MappingStore,
+    build_mapping_store,
+)
 from localtonet.server.pending import PendingConn, PendingTable
 from localtonet.server.registry import ClientRegistry, ClientSession
 from logging_setup import get_logger
@@ -57,6 +64,7 @@ _HTTP_PHRASES = {
     403: "Forbidden",
     404: "Not Found",
     409: "Conflict",
+    429: "Too Many Requests",
     500: "Internal Server Error",
     502: "Bad Gateway",
     503: "Service Unavailable",
@@ -65,23 +73,35 @@ _HTTP_PHRASES = {
 
 @dataclass
 class ServerStats:
-    """服务端累计计数。启动至今不清零，给日志与未来的指标接口用。"""
+    """服务端累计计数。启动至今不清零，给日志与未来的指标接口用。
+
+    ``clients_online`` 是唯一的 **gauge**（当前值），其余都是累计值。
+    ``requests_rejected`` 与 ``requests_failed`` 刻意分开：
+    前者是"压根没开始转发"（配额拒绝），后者是"转了但失败了"。
+    """
 
     clients_registered: int = 0
     registrations_rejected: int = 0
+    clients_online: int = 0
     requests_total: int = 0
     requests_failed: int = 0
+    requests_rejected: int = 0
     bytes_upload: int = 0
     bytes_download: int = 0
+    throttled_seconds: float = 0.0
+    """因带宽限速累计等待的秒数，用来回答"限速到底有没有在起作用"。"""
 
-    def to_dict(self) -> Dict[str, int]:
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "clients_registered": self.clients_registered,
             "registrations_rejected": self.registrations_rejected,
+            "clients_online": self.clients_online,
             "requests_total": self.requests_total,
             "requests_failed": self.requests_failed,
+            "requests_rejected": self.requests_rejected,
             "bytes_upload": self.bytes_upload,
             "bytes_download": self.bytes_download,
+            "throttled_seconds": round(self.throttled_seconds, 4),
         }
 
 
@@ -104,8 +124,10 @@ class TunnelServer:
         self._auth = authenticator or build_authenticator(config.auth)
         self._registry = registry or ClientRegistry(logger=self._log)
         self._pending = PendingTable(logger=self._log)
+        self._limiter = self._build_limiter(config.limits)
         self._mapping = MappingManager(
-            store=mapping_store or InMemoryMappingStore(),
+            # 存储后端由配置决定：memory（默认）或 file（重启后映射还在）
+            store=mapping_store or build_mapping_store(config.mapping_store, logger=self._log),
             on_visitor=self._handle_visitor,
             host=config.control.host,
             logger=self._log,
@@ -226,6 +248,11 @@ class TunnelServer:
     def pending(self) -> PendingTable:
         return self._pending
 
+    @property
+    def limiter(self) -> Optional[ClientRateLimiter]:
+        """带宽限速器；``None`` 表示配置里两个方向都没限速。"""
+        return self._limiter
+
     def snapshot(self) -> Dict[str, Any]:
         """一次性拿全服务端状态。GUI 表格、健康检查都可以直接用这个。"""
         return {
@@ -341,6 +368,7 @@ class TunnelServer:
 
         claimed, conflicts = self._registry.claim_ports(client_id, local_ports)
         self._stats.clients_registered += 1
+        self._sync_online()
 
         ack = make_msg(
             MsgType.REGISTER_ACK,
@@ -356,6 +384,7 @@ class TunnelServer:
         )
         if not await self._send(session, ack):
             self._registry.remove(client_id)
+            self._sync_online()
             return None
 
         self._log.info(
@@ -395,6 +424,10 @@ class TunnelServer:
         if removed is None:
             return
 
+        self._sync_online()
+        if self._limiter is not None:
+            # 释放该客户端的限速桶，否则客户端增删会慢慢把内存吃满
+            self._limiter.forget(client_id)
         self._pending.fail_all_for_client(client_id, "客户端已离线")
         await close_writer(removed.writer)
         self._log.info("客户端 %s 已下线（%s），端口 %s 归属已释放", client_id, reason, sorted(removed.local_ports))
@@ -529,15 +562,31 @@ class TunnelServer:
             if rule is None:
                 # 只在"连接已建立、映射紧接着被摘掉"的窗口里出现
                 self._log.warning("端口 %d 没有映射规则，回 404", public_port)
-                await self._reply_http(writer, 404, "No mapping for this port")
+                await self._reply_http(reader, writer, 404, "No mapping for this port")
                 return
 
             session = self._registry.pick_client(rule.local_port)
             if session is None:
                 self._stats.requests_failed += 1
                 self._log.warning("端口 %d 收到请求但没有在线客户端，回 502", public_port)
-                await self._reply_http(writer, 502, "No client online")
+                await self._reply_http(reader, writer, 502, "No client online")
                 return
+
+            # 单客户端并发配额：超了就**直接拒**，不排队。
+            # 排队会让访客连接白占着，还可能拖到 pair_timeout 才失败——
+            # 症状比 429 难查得多，而且对客户端也没有任何好处。
+            limit = self._config.limits.max_conns_per_client
+            if limit > 0:
+                inflight = self._pending.count_for_client(session.client_id)
+                if inflight >= limit:
+                    exc = QuotaExceededError(
+                        f"客户端 {session.client_id} 的并发转发数已达上限 {limit}"
+                    )
+                    self._stats.requests_rejected += 1
+                    self._log.warning("端口 %d 收到请求但客户端超配额，回 429：%s", public_port, exc)
+                    # 对外只给通用文案：公网访客不该看到内部 client_id
+                    await self._reply_http(reader, writer, exc.code, "Per-client concurrency limit reached")
+                    return
 
             pending = PendingConn(
                 conn_id=conn_id,
@@ -577,7 +626,7 @@ class TunnelServer:
             )
             if not notified:
                 self._stats.requests_failed += 1
-                await self._reply_http(writer, 502, "No client online")
+                await self._reply_http(reader, writer, 502, "No client online")
                 return
 
             if not await pending.wait_ready(self._config.timeouts.pair_timeout):
@@ -585,12 +634,12 @@ class TunnelServer:
                 if not pending.closed:
                     pending.fail(f"等待数据通道超时（{self._config.timeouts.pair_timeout:.0f}s）")
                 self._log.warning("conn=%s 配对失败：%s", conn_id, pending.error)
-                await self._reply_http(writer, 502, pending.error or "Data channel not ready")
+                await self._reply_http(reader, writer, 502, pending.error or "Data channel not ready")
                 return
 
             if pending.data_reader is None or pending.data_writer is None:  # pragma: no cover - 防御
                 self._stats.requests_failed += 1
-                await self._reply_http(writer, 502, "Data channel gone")
+                await self._reply_http(reader, writer, 502, "Data channel gone")
                 return
 
             stats = await pipe_both(
@@ -600,16 +649,20 @@ class TunnelServer:
                 pending.data_writer,
                 label=f"conn={conn_id}",
                 logger=self._log,
+                # 限速按 client_id 汇总：一个客户端开多条连接也绕不开自己的总配额
+                rate_limit=self._limiter,
+                limit_key=session.client_id,
             )
             self._stats.bytes_upload += stats.upload
             self._stats.bytes_download += stats.download
+            self._stats.throttled_seconds += stats.throttled
 
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - 单个请求出错不能影响其他请求
             self._stats.requests_failed += 1
             self._log.exception("处理访客请求 conn=%s 时发生未预期异常", conn_id)
-            await self._reply_http(writer, 502, "Internal tunnel error")
+            await self._reply_http(reader, writer, 502, "Internal tunnel error")
         finally:
             if pending is not None:
                 self._pending.discard(conn_id)
@@ -641,6 +694,23 @@ class TunnelServer:
     # ------------------------------------------------------------------ #
     # 辅助
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _build_limiter(limits: LimitsConfig) -> Optional[ClientRateLimiter]:
+        """按配置装配限速器。
+
+        两个方向都不限速时返回 ``None``，让 ``pipe_both`` 走无钩子的原路径——
+        默认配置下这条链路的开销必须是零。
+        """
+        limiter = ClientRateLimiter(
+            upload_bps=limits.per_client_upload_bps,
+            download_bps=limits.per_client_download_bps,
+        )
+        return limiter if limiter.enabled else None
+
+    def _sync_online(self) -> None:
+        """把"当前在线客户端数"这个 gauge 同步进统计。"""
+        self._stats.clients_online = self._registry.client_count
 
     async def _send(self, session: ClientSession, msg: Dict[str, Any]) -> bool:
         """向某个客户端发一条控制指令。失败返回 False（不抛异常）。"""
@@ -684,11 +754,26 @@ class TunnelServer:
         return self._config.control.host
 
     @staticmethod
-    async def _reply_http(writer: asyncio.StreamWriter, status: int, message: str) -> None:
+    async def _reply_http(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        status: int,
+        message: str,
+    ) -> None:
         """给访客回一个最小的 HTTP 错误响应。
 
-        MVP 不做完整的 HTTP 解析——转发是纯字节搬运，服务端只在**无法转发**时才
+        服务端不做完整的 HTTP 解析——转发是纯字节搬运，只在**无法转发**时才
         自己造响应。手写状态行比让 curl 收到空回复要好得多。
+
+        顺序上有两点很讲究：
+
+        1. 写完先 ``write_eof()`` 发 FIN，明确告诉对端"我说完了"；
+        2. 再把对端已经发来的请求字节**读掉**，然后才允许上层 close。
+
+        第 2 步不是可有可无的：带着未读的接收数据 close，TCP 会退化成发 RST 而不是 FIN，
+        而 Windows 在收到 RST 时会**丢弃客户端接收缓冲里尚未读走的响应**——
+        表现为"访客收到空回复"。curl 因为读得够快常常侥幸读全，脚本化的客户端则经常拿到 0 字节，
+        排查起来非常费劲。
         """
         phrase = _HTTP_PHRASES.get(status, "Error")
         body = f"{status} {message}\n".encode("utf-8")
@@ -702,6 +787,9 @@ class TunnelServer:
         try:
             writer.write(head + body)
             await writer.drain()
+            close_write_side(writer)
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(reader.read(65536), timeout=0.1)
         except (OSError, ConnectionError, RuntimeError):
             pass
 

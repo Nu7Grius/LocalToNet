@@ -9,8 +9,8 @@ localtonet.core.pipe —— 双向字节搬运
 * 结束前对两个写端做**半关闭**（``write_eof``），让对端能及时读到 EOF 而不是干等到超时；
 * 返回搬运字节数，供观测与将来的带宽限流使用。
 
-**扩展点**：要加带宽限流，只需在 ``pump`` 内写入前挂一个令牌桶，
-不必改动调用方；要加传输加密，在建立连接处包一层即可，本函数不感知。
+**扩展点**：带宽限流的钩子已经挂好（``rate_limit`` 参数），实现见
+:mod:`localtonet.core.limiter`；要加传输加密，在建立连接处包一层即可，本函数不感知。
 """
 
 from __future__ import annotations
@@ -18,14 +18,41 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Protocol
 
 from logging_setup import get_logger
 
-__all__ = ["CHUNK_SIZE", "PipeStats", "pipe_both", "close_writer", "close_write_side"]
+__all__ = [
+    "CHUNK_SIZE",
+    "UPLOAD_DIRECTION",
+    "DOWNLOAD_DIRECTION",
+    "RateLimitHook",
+    "PipeStats",
+    "pipe_both",
+    "close_writer",
+    "close_write_side",
+]
 
 CHUNK_SIZE = 64 * 1024
 """单次搬运的字节数。过小会放大系统调用开销，过大则增加内存占用与首字节延迟。"""
+
+UPLOAD_DIRECTION = "a->b"
+"""上行：访客 → 数据通道 → 内网后端。也是 ``pump`` 的 tag 与统计字段名。"""
+
+DOWNLOAD_DIRECTION = "b->a"
+"""下行：内网后端 → 数据通道 → 访客。"""
+
+
+class RateLimitHook(Protocol):
+    """写入前的限速钩子。
+
+    ``pipe`` 刻意不认识"客户端""配额"这类业务概念：它只把调用方给的 ``key``
+    与方向原样转交出去，怎么按 key 汇总由钩子自己决定
+    （服务端实现见 :class:`localtonet.core.limiter.ClientRateLimiter`）。
+    """
+
+    async def wait(self, key: str, direction: str, amount: int) -> float:
+        """在写入 ``amount`` 字节前取配额，返回本次等待的秒数（0 表示没等）。"""
 
 
 @dataclass
@@ -36,6 +63,8 @@ class PipeStats:
     """访客 → 数据通道 → 内网后端 的字节数。"""
     download: int = 0
     """内网后端 → 数据通道 → 访客 的字节数。"""
+    throttled: float = 0.0
+    """因限速累计等待的秒数（按速率换算，不是实测墙钟）。0 表示全程没被限速。"""
     stopped_by: str = ""
 
     @property
@@ -47,6 +76,7 @@ class PipeStats:
             "upload": self.upload,
             "download": self.download,
             "total": self.total,
+            "throttled": round(self.throttled, 4),
             "stopped_by": self.stopped_by,
         }
 
@@ -87,6 +117,8 @@ async def pipe_both(
     *,
     label: str = "",
     logger: Optional[logging.Logger] = None,
+    rate_limit: Optional[RateLimitHook] = None,
+    limit_key: str = "",
 ) -> PipeStats:
     """在 (a_reader/a_writer) 与 (b_reader/b_writer) 之间做双向搬运。
 
@@ -97,6 +129,10 @@ async def pipe_both(
 
     写成 ``a_reader → a_writer`` 就成了原地回环——数据读出来又写回自己，
     表现为"看着有流量但对方永远收不到"，是个很有迷惑性的坑。
+
+    ``rate_limit`` 是本函数预留的**带宽限流挂载点**：每个方向在写入前先向它取配额，
+    ``limit_key`` 是汇总单位（服务端传 ``client_id``）。传 ``None`` 即完全不过桶、
+    走原路径，既有调用方与性能都不受影响。
     """
     log = logger or get_logger("pipe")
     stats = PipeStats()
@@ -113,6 +149,10 @@ async def pipe_both(
                 chunk = await src.read(CHUNK_SIZE)
                 if not chunk:
                     break
+                if rate_limit is not None:
+                    # 限速必须在写入**之前**：目的是给 drain 一个节奏，
+                    # 而不是让写缓冲先堆积起来再慢慢吐。
+                    stats.throttled += await rate_limit.wait(limit_key, tag, len(chunk))
                 setattr(stats, counter_attr, getattr(stats, counter_attr) + len(chunk))
                 dst.write(chunk)
                 await dst.drain()
@@ -128,8 +168,8 @@ async def pipe_both(
             close_write_side(dst)
 
     tasks = [
-        asyncio.create_task(pump(a_reader, b_writer, "a->b", "upload")),
-        asyncio.create_task(pump(b_reader, a_writer, "b->a", "download")),
+        asyncio.create_task(pump(a_reader, b_writer, UPLOAD_DIRECTION, "upload")),
+        asyncio.create_task(pump(b_reader, a_writer, DOWNLOAD_DIRECTION, "download")),
     ]
 
     try:

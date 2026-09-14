@@ -10,6 +10,9 @@ client.py —— 客户端入口（内网侧）
 
 客户端管三件事：连上服务端控制通道、维持心跳、把访客请求转进本机后端。
 断线会自动指数退避重连（1s → 60s 封顶），重连成功后重新认领端口。
+
+退出码：``0`` 正常结束；``1`` 运行期失败（含被服务端**永久拒绝**的 403）；
+``2`` 配置错误。被 403 拒掉时绝不能返回 0——脚本里 ``&&`` 会把"账号被拒"当成成功。
 """
 
 from __future__ import annotations
@@ -116,6 +119,10 @@ async def connect(config: ClientConfig) -> int:
         pass
     finally:
         await client.stop()
+    if client.fatal:
+        # 被 403 永久拒绝不是"正常结束"：返回 0 会让 `client.py --token wrong && echo ok`
+        # 打出 ok，脚本化场景下误导性极强。
+        return 1
     return 0
 
 

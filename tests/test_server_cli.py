@@ -32,6 +32,8 @@ _ENV_KEYS = (
     "LOCALTONET_DATA_HOST",
     "LOCALTONET_ADVERTISE_HOST",
     "LOCALTONET_AUTH_TOKEN",
+    "LOCALTONET_MAPPING_STORE",
+    "LOCALTONET_MAPPING_STORE_PATH",
     "LOCALTONET_LOG_LEVEL",
 )
 
@@ -140,3 +142,66 @@ def test_demo_config_keeps_auth_disabled() -> None:
 
     assert config.auth.enabled is False
     assert config.auth.token == ""
+
+
+# --------------------------------------------------------------------------- #
+# 映射持久化参数
+# --------------------------------------------------------------------------- #
+
+
+def test_default_stays_in_memory(tmp_path: Path) -> None:
+    path = write_server_config(tmp_path)
+    config = load_config(parse(["-c", str(path)]))
+
+    assert config.mapping_store.type == "memory"
+    assert config.mapping_store.path == ""
+
+
+def test_cli_mapping_store_selects_file_backend(tmp_path: Path) -> None:
+    path = write_server_config(tmp_path)
+    config = load_config(
+        parse(["-c", str(path), "--mapping-store", "file", "--mapping-store-path", "state/m.json"])
+    )
+
+    assert config.mapping_store.type == "file"
+    assert config.mapping_store.path == "state/m.json"
+
+
+def test_cli_mapping_store_path_implies_file_mode(tmp_path: Path) -> None:
+    """只给路径时自动切到 file——"给了持久化路径却还留在 memory 模式"最容易踩空。"""
+    path = write_server_config(tmp_path)
+    config = load_config(parse(["-c", str(path), "--mapping-store-path", "state/m.json"]))
+
+    assert config.mapping_store.type == "file"
+
+
+def test_cli_mapping_store_overrides_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("LOCALTONET_MAPPING_STORE", "file")
+    monkeypatch.setenv("LOCALTONET_MAPPING_STORE_PATH", "from-env.json")
+    path = write_server_config(tmp_path)
+
+    config = load_config(parse(["-c", str(path), "--mapping-store", "memory"]))
+
+    # 命令行优先级最高：type 被改回 memory，path 仍保留环境变量的值（不冲突）
+    assert config.mapping_store.type == "memory"
+    assert config.mapping_store.path == "from-env.json"
+
+
+def test_cli_mapping_store_rejects_unknown_backend(tmp_path: Path) -> None:
+    path = write_server_config(tmp_path)
+    with pytest.raises(SystemExit) as excinfo:
+        parse(["-c", str(path), "--mapping-store", "sqlite"])
+
+    assert excinfo.value.code == 2
+
+
+def test_file_mode_without_path_exits_with_code_2(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """``--mapping-store file`` 却不给路径 → 走配置错误退出码，而不是启动到一半炸掉。"""
+    path = write_server_config(tmp_path)
+
+    code = main(["-c", str(path), "--mapping-store", "file"])
+
+    assert code == 2
+    assert "mapping_store.path" in capsys.readouterr().err

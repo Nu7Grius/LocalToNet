@@ -32,6 +32,7 @@ __all__ = [
     "ListenerConfig",
     "AuthConfig",
     "LimitsConfig",
+    "MappingStoreConfig",
     "LogConfig",
     "ServerConfig",
     "ClientConfig",
@@ -259,13 +260,28 @@ class AuthConfig:
 
 @dataclass
 class LimitsConfig:
-    """资源上限，同时也是一层拒绝服务防护。"""
+    """资源上限，同时也是一层拒绝服务防护。
+
+    两类语义必须分开看：
+
+    * ``max_*`` —— **容量**，必须为正；撞上它意味着"服务端该扩容了"（``503``）。
+    * ``*_per_client`` / ``per_client_*`` —— **单客户端配额**，``0`` 表示不限；
+      撞上它意味着"某个客户端该收敛了"（``429``）。
+    """
 
     max_msg_len: int = 10 * 1024 * 1024
     max_clients: int = 64
     max_mappings: int = 32
+    max_conns_per_client: int = 0
+    """单个客户端同时进行中的访客转发数上限。0 表示不限。"""
+    per_client_upload_bps: int = 0
+    """单个客户端的上行带宽上限（字节/秒）。0 表示不限。"""
+    per_client_download_bps: int = 0
+    """单个客户端的下行带宽上限（字节/秒）。0 表示不限。"""
 
-    _FIELDS = ("max_msg_len", "max_clients", "max_mappings")
+    _CAPACITY_FIELDS = ("max_msg_len", "max_clients", "max_mappings")
+    _QUOTA_FIELDS = ("max_conns_per_client", "per_client_upload_bps", "per_client_download_bps")
+    _FIELDS = _CAPACITY_FIELDS + _QUOTA_FIELDS
 
     @classmethod
     def from_dict(cls, data: Optional[Mapping[str, Any]]) -> "LimitsConfig":
@@ -275,12 +291,49 @@ class LimitsConfig:
         return cls(**{k: _as_int(v, f"limits.{k}") for k, v in data.items()})
 
     def validate(self) -> None:
-        if self.max_msg_len <= 0:
-            raise ConfigError("limits.max_msg_len 必须为正数")
-        if self.max_clients <= 0:
-            raise ConfigError("limits.max_clients 必须为正数")
-        if self.max_mappings <= 0:
-            raise ConfigError("limits.max_mappings 必须为正数")
+        for name in self._CAPACITY_FIELDS:
+            if getattr(self, name) <= 0:
+                raise ConfigError(f"limits.{name} 必须为正数")
+        for name in self._QUOTA_FIELDS:
+            if getattr(self, name) < 0:
+                raise ConfigError(f"limits.{name} 不能为负数（0 表示不限）")
+
+
+@dataclass
+class MappingStoreConfig:
+    """映射表存储后端。
+
+    ``memory``（默认）—— 进程重启即回到配置文件里的 mapping。
+    ``file`` —— 把映射表持久化到 JSON，**重启后以文件为准**；
+    配置文件的 ``mapping`` 退化为"首次种子"，只在文件不存在或内容为空时生效。
+
+    最后这条是"持久化不能白做"的前提：若照旧用配置文件覆盖 store，
+    每次重启都会把持久化的内容冲掉，等于没持久化。
+    """
+
+    type: str = "memory"
+    path: str = ""
+
+    _FIELDS = ("type", "path")
+    _TYPES = ("memory", "file")
+
+    @classmethod
+    def from_dict(cls, data: Optional[Mapping[str, Any]]) -> "MappingStoreConfig":
+        if data is None:
+            return cls()
+        _check_unknown(data, cls._FIELDS, "mapping_store")
+        return cls(
+            type=_as_str(data.get("type", "memory"), "mapping_store.type").strip().lower(),
+            path=_as_str(data.get("path", ""), "mapping_store.path"),
+        )
+
+    def validate(self) -> None:
+        if self.type not in self._TYPES:
+            raise ConfigError(
+                f"mapping_store.type 必须是 {list(self._TYPES)} 之一，实际为 {self.type!r}"
+            )
+        if self.type == "file" and not self.path.strip():
+            raise ConfigError("mapping_store.type 为 file 时必须提供 mapping_store.path")
 
 
 @dataclass
@@ -322,6 +375,8 @@ class ServerConfig:
     这样同一份配置既能跑 127.0.0.1 本地演示，也能跑公网部署，不必改配置。"""
 
     mapping: List[MappingRule] = field(default_factory=list)
+    mapping_store: MappingStoreConfig = field(default_factory=MappingStoreConfig)
+    """映射表的存储后端。``type=file`` 时以持久化文件为准，``mapping`` 仅作首次种子。"""
     timeouts: Timeouts = field(default_factory=Timeouts)
     reconnect: ReconnectPolicy = field(default_factory=ReconnectPolicy)
     auth: AuthConfig = field(default_factory=AuthConfig)
@@ -334,6 +389,7 @@ class ServerConfig:
         "data",
         "advertise_host",
         "mapping",
+        "mapping_store",
         "timeouts",
         "reconnect",
         "auth",
@@ -359,6 +415,7 @@ class ServerConfig:
                 MappingRule.from_dict(_require_mapping(item, f"mapping[{i}]"), f"mapping[{i}]")
                 for i, item in enumerate(raw_mapping)
             ],
+            mapping_store=MappingStoreConfig.from_dict(data.get("mapping_store")),
             timeouts=Timeouts.from_dict(data.get("timeouts")),
             reconnect=ReconnectPolicy.from_dict(data.get("reconnect")),
             auth=AuthConfig.from_dict(data.get("auth")),
@@ -390,6 +447,10 @@ class ServerConfig:
         if "auth_token" in env:
             cfg.auth.token = env["auth_token"]
             cfg.auth.enabled = True
+        if "mapping_store" in env:
+            cfg.mapping_store.type = env["mapping_store"].strip().lower()
+        if "mapping_store_path" in env:
+            cfg.mapping_store.path = env["mapping_store_path"]
         if "log_level" in env:
             cfg.log.level = env["log_level"].upper()
         cfg.validate()
@@ -419,6 +480,7 @@ class ServerConfig:
         self.timeouts.validate()
         self.reconnect.validate()
         self.auth.validate()
+        self.mapping_store.validate()
         self.limits.validate()
         self.log.validate()
 

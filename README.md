@@ -18,6 +18,9 @@
 - **指数退避重连**：1s → 2s → 4s → … → 60s 封顶，成功即归零
 - **明确错误语义**：404 / 502 兜底，绝不留下"空回复"
 - **可选共享令牌鉴权**：一行 `--token` 开启；令牌错了立刻停手（403），容量满了继续重试（503）
+- **带宽限流**：按客户端、按方向（上行/下行）独立限速，令牌桶平滑而非"每秒硬切"
+- **并发配额**：限制单客户端同时在途的转发数，超了直接回 `429`，不排队、不拖垮服务端
+- **映射持久化**：`--mapping-store file` 把映射表落到 JSON，重启服务端不再回到配置文件的状态
 - **零运行时依赖**：纯标准库（界面用自带的 tkinter），Python 3.11+（开发环境用 3.13）
 
 ## 架构
@@ -125,6 +128,105 @@ python client.py --server 1.2.3.4:7000 --local-ports 8000,8080 --client-id my-pc
 > ⚠️ 令牌目前是**明文**放在 `register_client` 帧里走 TCP，`client.json` 里也是明文落盘。
 > 公网部署请置于 TLS 终止层（Nginx / Caddy）之后，或按「扩展点」表接入传输加密。
 
+## 限流、配额与映射持久化
+
+这三项都是**服务端侧**的可选能力，默认全部关闭——不配就是零开销（限流器连对象都不创建）。
+
+### 带宽限流
+
+挂在 `pipe_both` 的写入循环上，按**客户端**聚合、**上行/下行独立**计数：
+
+```json
+{
+  "limits": {
+    "per_client_upload_bps": 1048576,
+    "per_client_download_bps": 4194304,
+    "max_conns_per_client": 16
+  }
+}
+```
+
+（仓库自带的演示 `config.json` 里这三个字段都没写，即全部不限速、不限并发；
+`limits` 下原有的 `max_clients` / `max_mappings` / `max_msg_len` 是**容量**上限，
+仍然是"必须大于 0"的硬约束，与新增的配额字段语义不同。）
+
+| 字段 | 含义 | 默认 |
+| --- | --- | --- |
+| `per_client_upload_bps` | 单客户端上行（访客 → 内网）字节/秒 | `0` = 不限 |
+| `per_client_download_bps` | 单客户端下行（内网 → 访客）字节/秒 | `0` = 不限 |
+| `max_conns_per_client` | 单客户端同时在途的转发连接数 | `0` = 不限 |
+
+命令行：**暂无**。`limits` 这一组字段目前只走配置文件（`server.py` 的 CLI 没有对应开关，
+环境变量也只覆盖 `control/data` 端口与 `auth`、`mapping_store`）。要调限流参数请改 `config.json`。
+
+实现是**令牌桶**，不是"每秒整数切分"：桶容量取 `max(rate × burst_seconds, 16KB)`（`burst_seconds`
+默认 0.25s，`16KB` 是下限，避免低速时限速被"一次只能发几十字节"卡死），
+请求大于桶容量时拆成多段依次等待。所以限速是平滑的，突发小流量不会被生硬地拦下。
+
+```python
+# localtonet/core/limiter.py
+bucket = TokenBucket(rate=1048576, burst=262144)
+waited = await bucket.acquire(len(chunk))   # 返回累计等待秒数，不 busy-wait
+```
+
+等待用 `await asyncio.sleep(deficit / rate)`，`acquire()` 返回的等待秒数累加到
+`PipeStats.throttled`，最终汇总进 `ServerStats.throttled_seconds`，便于观测"这条链路被限了多久"。
+时钟与 sleep 都可注入，测试用假时钟断言**不空转**。
+
+### 并发配额
+
+访客请求进来时先查该客户端在途转发数，超了立刻回 `429` 并**不排队**：
+
+```python
+inflight = self._pending.count_for_client(session.client_id)
+if limit > 0 and inflight >= limit:
+    await self._reply_http(reader, writer, 429, "Per-client concurrency limit reached")
+    return
+```
+
+选择"直接拒"而不是"排队"：排队的连接会占着服务端 fd 与内存，把服务端自己的容量拖垮；
+快速失败让客户端（或前面的 Nginx）自己决定退避策略，边界更清晰。
+
+### 映射持久化
+
+默认 `memory`（与原行为一致，重启回到配置文件状态）。要跨重启保留运行期改动：
+
+```bash
+python server.py --mapping-store file --mapping-store-path mappings.json
+# 或等价的环境变量
+LOCALTONET_MAPPING_STORE=file LOCALTONET_MAPPING_STORE_PATH=mappings.json python server.py
+```
+
+```json
+{ "mapping_store": { "type": "file", "path": "mappings.json" } }
+```
+
+| 字段 | 取值 | 说明 |
+| --- | --- | --- |
+| `type` | `memory` / `file` | 存储后端；`file` 必须给 `path` |
+| `path` | 文件路径 | 只给 `--mapping-store-path` 会**隐式切到 file 模式** |
+
+**谁的优先级更高？** 落盘文件是权威，`config.json` 的 `mapping` 只在文件不存在时当种子：
+
+| 启动时 | 实际监听的端口 |
+| --- | --- |
+| 文件不存在 / 为空 | `config.json` 的 `mapping`（并立即落盘一份） |
+| 文件有内容 | **文件内容**；若与 `config.json` 不一致，日志给一条 WARNING 提示 |
+
+> 这与全局的"配置文件优先"铁律是**刻意的例外**：持久化的意义就是"运行期改动能活过重启"。
+> 若还让 `config.json` 覆盖它，`set_mapping` 的效果一重启就没了，持久化等于白做。
+> 想清空持久化状态，删掉那个 JSON 文件即可。
+
+写入用 `临时文件 + flush + fsync + os.replace`，保证不会出现写了一半的坏文件：
+
+| 情况 | 行为 |
+| --- | --- |
+| 落盘失败（磁盘满 / 只读） | **降级**：记 ERROR 日志并继续服务，内存映射仍然生效 |
+| 文件内容损坏 / 不是数组 / 端口重复 | **fail fast**：抛 `ConfigError`，退出码 `2`，日志给出恢复提示 |
+
+写入失败只降级、读取失败就报错——因为前者的代价是"这次改动没存住"，
+后者意味着"接下来监听的端口可能是错的"，宁可不开。
+
 ## 目录结构
 
 ```
@@ -139,7 +241,8 @@ LocalToNet/
 │   ├── errors.py             业务异常（带 code，用于映射 HTTP 状态码）
 │   ├── core/                 两端共用基础设施
 │   │   ├── dispatcher.py     指令注册表（@handler 装饰器）
-│   │   ├── pipe.py           双向字节搬运 pipe_both
+│   │   ├── pipe.py           双向字节搬运 pipe_both + 限流挂载点
+│   │   ├── limiter.py        令牌桶与按客户端限流器（ClientRateLimiter）
 │   │   ├── heartbeat.py      心跳任务 + 失联看门狗
 │   │   ├── backoff.py        指数退避
 │   │   ├── events.py         事件总线（GUI / 指标挂载点）
@@ -149,7 +252,7 @@ LocalToNet/
 │   │   ├── core.py           三通道编排
 │   │   ├── registry.py       在线客户端表 + 端口归属路由
 │   │   ├── pending.py        访客连接与数据通道的配对挂起
-│   │   ├── mapping.py        映射表与访客端口监听生命周期
+│   │   ├── mapping.py        映射表、存储后端（内存 / JSON 文件）与访客端口监听生命周期
 │   │   └── auth.py           鉴权（放行 / 共享令牌，常量时间比较）
 │   ├── client/               客户端
 │   │   ├── core.py           控制长连接、心跳、重连
@@ -161,7 +264,7 @@ LocalToNet/
 │       ├── viewmodel.py      邮筒消息 → 表格与状态栏（纯逻辑）
 │       └── app.py            窗口、表格、按钮、状态栏、日志面板
 ├── examples/demo_backend.py  演示用内网 HTTP 服务
-└── tests/                    158 项测试（单测 + 端到端 + GUI + 命令行）
+└── tests/                    231 项测试（单测 + 端到端 + GUI + 命令行）
 ```
 
 ## 协议
@@ -197,7 +300,24 @@ LocalToNet/
 >
 > `code` 里有两类必须**分开对待**，混同任何一边都是 bug：
 > `403` 凭据不对 → **永久失败**，客户端停止重试；
-> `503`（`limits.max_clients` 已满）→ **暂时失败**，客户端继续退避重试。
+> `503`（`limits.max_clients` 已满）/ `429`（单客户端配额已满）→ **暂时失败**，客户端继续退避重试。
+
+### 访客端口上的 HTTP 状态码
+
+服务端只在**自己无法转发**时才手写最小 HTTP 响应（正常转发是纯字节搬运，不解析 HTTP）：
+
+| 状态码 | 触发条件 | 语义 |
+| --- | --- | --- |
+| `404` | 访客端口没有对应映射规则（竞态窗口） | 请求打到了不该监听的端口 |
+| `502` | 无在线客户端 / 数据通道没就绪 / 配对超时 / 内网后端连不上 | 转发链路断了，原因写在 body 里 |
+| `429` | 该客户端的在途转发数已达 `limits.max_conns_per_client` | **客户端自己的额度满了**，稍后重试即可 |
+| `503` | 服务端容量满（`limits.max_clients`） | **服务端整体挤不下**，与具体客户端无关 |
+
+> `429` 与 `503` 是两件事：前者是"你一个人的额度用完了"（其他客户端照常），
+> 后者是"整台机器满了"。合并成一个码会让客户端无法判断该不该退避、运维也无法定位瓶颈。
+>
+> 回执与展示统一用 `exc.message`（不带 `[code]` 前缀），只有日志里才用 `str(exc)`。
+> 混用会出现 `[403] [403] …` 叠字。
 
 ## 核心机制
 
@@ -218,6 +338,11 @@ LocalToNet/
 | 服务端上没有在线客户端 | `502 No client online` |
 | 客户端连不上内网后端 | `502` + **真实原因**（经 `conn_error` 上报） |
 | 配对超时 | `502` + 超时时长 |
+| 单客户端在途转发数超配额 | `429 Per-client concurrency limit reached` |
+
+> 响应写完先半关闭写端（`write_eof`）再丢弃对端剩余请求字节——否则带着未读数据关闭连接，
+> TCP 会发 **RST 而不是 FIN**，Windows 上未读走的响应字节会被直接丢掉，
+> 表现为客户端读到 0 字节 + `ConnectionAbortedError`（`curl` 因为读得快反而"看起来正常"）。
 
 > ⚠️ 配置约束：`pair_timeout` 必须**明显大于**客户端的 `connect_timeout`。
 > 否则客户端来不及上报 `conn_error`，访客只会看到笼统的"配对超时"，
@@ -282,10 +407,10 @@ Linux 上若缺 tkinter，安装系统包 `python3-tk` 即可（Windows/macOS �
 | 指令处理 | `core.dispatcher.MessageDispatcher` | `@handler` 注册表 | 新增指令零侵入主循环 |
 | 客户端鉴权 | `server.auth.Authenticator` | `NoneAuthenticator` / `TokenAuthenticator`（共享令牌） | mTLS / 签名挑战 / SSO |
 | 端口路由策略 | `ClientRegistry(routing=...)` | 归属优先 → 首个在线 | 轮询 / 加权 / 标签路由 |
-| 映射持久化 | `server.mapping.MappingStore` | 内存 | JSON 文件 / SQLite / Redis |
+| 映射持久化 | `server.mapping.MappingStore` | 内存 / JSON 文件（原子写） | SQLite / Redis |
 | 映射校验规则 | `core.rules.parse_mapping` | 服务端与 GUI 共用一份 | 增删规则只改这一处 |
 | 界面与观测 | `core.events.EventBus` | tkinter GUI + 结构化日志 | Web 界面 / Prometheus |
-| 限流配额 | `core.pipe.pipe_both` 写入循环 | 无 | 令牌桶限带宽 |
+| 限流配额 | `core.pipe.RateLimitHook` | `ClientRateLimiter`（令牌桶，按客户端 × 方向） | 加权公平队列 / 按端口限速 |
 | 传输加密 | 建立连接处 | 明文 | TLS / 会话密钥 |
 | 超时参数 | `config.Timeouts` | 集中默认值 | 环境变量 / 运行时可调 |
 
@@ -300,9 +425,10 @@ python -m pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-当前 **158 项全部通过**（test_protocol 17 / test_config 22 / test_core 33 / test_e2e 16 /
-test_server_cli 7 / test_gui_model 47 / test_gui_bridge 10 / test_gui_controller 6），
-其中 16 项是真实拉起三件套、走真实 TCP 的端到端测试：
+当前 **231 项全部通过**（test_protocol 17 / test_config 40 / test_core 40 / test_e2e 21 /
+test_server_cli 13 / test_client_cli 4 / test_limiter 12 / test_mapping_store 21 /
+test_gui_model 47 / test_gui_bridge 10 / test_gui_controller 6），
+其中 21 项是真实拉起三件套、走真实 TCP 的端到端测试：
 
 | 用例 | 验证内容 |
 | --- | --- |
@@ -322,13 +448,27 @@ test_server_cli 7 / test_gui_model 47 / test_gui_bridge 10 / test_gui_controller
 | 令牌错误 | `403` → 客户端**只拨号一次**、状态 `stopped`、`CONTROL_LOST(fatal=True)` |
 | 令牌缺失 | 同上，症状与令牌错误完全一致 |
 | 容量已满 | `503` **不**被当成 fatal，客户端继续退避重试；已在线客户端不受影响 |
+| 带宽限流 | 限速后同一份数据的耗时**明显长于**不限速基线，且字节数一个不少 |
+| 并发配额 | 打满 `max_conns_per_client` 后新请求回 `429`；在途请求照常返回 200 |
+| 在线数观测 | `stats.clients_online` 随客户端上下线增减 |
+| 运行期持久化 | `set_mapping` 后映射文件立刻出现新端口 |
+| 重启后存活 | 换一个 `TunnelServer` 实例重启，仍监听上次持久化的端口，而 `config.json` 里的端口未生效 |
 
 > 后两条守的是同一条线：`403` 与 `503` 必须**分开处理**——凭据错重试无意义（停手），
 > 容量满重试有意义（继续）。把它们统一成任一种都是 bug。
 
-`tests/test_server_cli.py` 覆盖服务端命令行参数（`--token` / `--no-auth` 与配置优先级铁律），
-其中一条专门钉死"仓库自带的 `config.json` 必须保持 `auth.enabled=false`"——
+`tests/test_limiter.py` 用假时钟（记录每次 sleep 的时长）断言令牌桶**真的在等**而不是空转：
+初始桶是满的、请求大于桶容量时被拆分且总量守恒、`rate <= 0` 被拒、禁用时不创建任何桶。
+`tests/test_mapping_store.py` 覆盖文件后端的原子写、损坏文件的 fail fast、写入失败的降级，
+以及"落盘文件权威、`config.json` 只当种子"这条语义（内存后端同样遵守，因为是存储层语义）。
+
+`tests/test_server_cli.py` 覆盖服务端命令行参数（`--token` / `--no-auth` / `--mapping-store*`
+与配置优先级铁律），其中一条专门钉死"仓库自带的 `config.json` 必须保持 `auth.enabled=false`"——
 免得哪天演示配置被顺手改成要令牌，本地 demo 突然跑不起来。
+
+`tests/test_client_cli.py` 用子进程跑真实 `client.py` 对着一个"必定拒绝"的假服务端，钉死
+**退出码契约**：令牌错 → `1`；配置缺失 → `2`；`503` → 进程**继续活着**（不是启动即退），
+以及回执消息里**不带** `[403]` 前缀。
 
 `tests/test_core.py` 另有针对 `pipe_both` 交叉配对的回归用例——
 上行与下行必须写向**对侧**，写成 `a_reader → a_writer` 就成了原地回环，
@@ -344,17 +484,19 @@ GUI 相关的三项测试（`test_gui_model` / `test_gui_bridge` / `test_gui_con
 
 - 只代理 TCP，不支持 UDP
 - 不做 HTTP 解析与改写：转发是纯字节搬运，仅在自己无法转发时才手写最小 HTTP 错误响应
-- 映射表仅存内存，服务端重启后回到配置文件的状态
+- 映射表默认只存内存；`--mapping-store file` 已可落盘，但**只支持单进程**（多实例共享同一文件会互相覆盖）
 - **界面改的是服务端的映射表**；客户端"认领哪些本机端口"仍来自启动配置
   （协议里没有运行期修改认领端口的指令，要支持得先扩展协议）
 - 图形界面需要 tkinter（CPython 标准库，不算第三方依赖）；
   精简安装的 Linux 上可能需要 `apt install python3-tk`
-- 未内置限速与流量统计页面（接口均已预留）
+- 限流是**按客户端聚合**的粗粒度：同一客户端的所有端口共享一份带宽额度，
+  要做"按端口"或"按访客 IP"限速需换 `RateLimitHook` 实现
+- 限流与配额**只在服务端生效**：客户端侧不做自我限速（服务端是唯一的流量汇聚点，
+  在汇聚点限流才能防住"客户端被改坏/恶意"的情况）
 - **传输仍是明文**：令牌放在 `register_client` 帧里走 TCP，`client.json` 里也明文落盘。
   公网部署建议置于 TLS 终止层之后，或按上面的扩展点接入加密
 - 鉴权只有**共享令牌**，没有按客户端区分身份：持有令牌的客户端可以认领任意访客端口；
   且令牌以命令行参数给出时会出现在进程列表里（生产环境优先用环境变量或受限权限的配置文件）
 - 令牌是**静态**的：轮换需要重启服务端（换成 mTLS / 签名挑战 / 一次性票据见扩展点表）
 
-后续计划：映射持久化（换 `MappingStore` 实现，界面无须改动）→ 按请求的带宽统计 →
-限流配额（复用 `403` / `503` 语义）→ TLS 与证书分发 → 服务端侧管理界面。
+后续计划：TLS 与证书分发 → 服务端侧管理界面 → 按请求的带宽统计与限流粒度细化。

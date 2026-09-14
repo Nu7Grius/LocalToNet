@@ -132,6 +132,15 @@ class TunnelClient:
         return self._state
 
     @property
+    def fatal(self) -> bool:
+        """是否是**永久性失败**（目前只有 403）导致停止。
+
+        脚本化场景靠它判退出码：被 403 拒掉却返回 0，
+        会让 ``client.py --token wrong && echo ok`` 打出 ok，误导性极强。
+        """
+        return self._fatal
+
+    @property
     def stats(self) -> ClientStats:
         return self._stats
 
@@ -156,6 +165,7 @@ class TunnelClient:
         return {
             "client_id": self._client_id,
             "state": self._state,
+            "fatal": self._fatal,
             "server": f"{self._config.server_host}:{self._config.control_port}",
             "local_ports": list(self._config.local_ports),
             "claimed": list(self._claimed),
@@ -192,6 +202,7 @@ class TunnelClient:
             except RegistrationError as exc:
                 if exc.is_fatal:
                     self._state = "stopped"
+                    self._fatal = True
                     self._log.error("注册被永久拒绝（%s），停止重试", exc)
                     self._events.emit(EventType.CONTROL_LOST, reason=str(exc), fatal=True)
                     return

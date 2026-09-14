@@ -9,6 +9,8 @@ server.py —— 服务端入口（公网侧）
     python server.py --mapping 9028:8000      # 临时映射，覆盖配置文件里的 mapping
     python server.py --token s3cret           # 开启 token 鉴权
     python server.py --no-auth                # 强制关闭鉴权（覆盖 JSON / 环境变量）
+    python server.py --mapping-store file --mapping-store-path mappings.json
+                                              # 映射持久化，重启后映射还在
 
 配置文件格式见 ``config.json``；所有字段都可用 ``LOCALTONET_`` 前缀的环境变量覆盖，
 命令行参数的优先级最高（默认值 < JSON < 环境变量 < 命令行）。
@@ -65,6 +67,16 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="公网:本地",
         help="端口映射，可重复；一旦指定就整体替换配置文件里的 mapping",
     )
+    parser.add_argument(
+        "--mapping-store",
+        choices=("memory", "file"),
+        help="映射表存储方式：memory（默认，重启即回到配置文件）或 file（持久化，重启后以文件为准）",
+    )
+    parser.add_argument(
+        "--mapping-store-path",
+        metavar="路径",
+        help="持久化文件路径（默认 mappings.json，相对当前工作目录）；会自动开启 file 模式",
+    )
     auth_group = parser.add_mutually_exclusive_group()
     auth_group.add_argument(
         "--token",
@@ -102,6 +114,13 @@ def load_config(args: argparse.Namespace) -> ServerConfig:
         config.advertise_host = args.advertise_host
     if args.mapping:
         config.mapping = list(args.mapping)
+    # 映射存储：命令行优先级最高。只给路径时自动切到 file——
+    # "给了持久化路径却还留在 memory 模式"是最容易让人踩空的组合。
+    if args.mapping_store:
+        config.mapping_store.type = args.mapping_store
+    if args.mapping_store_path:
+        config.mapping_store.path = args.mapping_store_path
+        config.mapping_store.type = "file"
     # 鉴权：命令行优先级最高（默认值 < JSON < 环境变量 < 命令行）。
     # --token 的 default 必须是 None，否则无法区分"没给"和"给了空串"。
     if args.no_auth:
@@ -124,7 +143,12 @@ def load_config(args: argparse.Namespace) -> ServerConfig:
 
 async def serve(config: ServerConfig) -> int:
     log = get_logger("server.cli")
-    server = TunnelServer(config)
+    try:
+        server = TunnelServer(config)
+    except ConfigError as exc:
+        # 持久化映射文件损坏这类问题归到"配置错误"，与命令行解析失败同一个退出码
+        print(f"配置错误：{exc}", file=sys.stderr)
+        return 2
 
     def announce(**payload: object) -> None:
         log.info("服务端就绪：%s", payload)

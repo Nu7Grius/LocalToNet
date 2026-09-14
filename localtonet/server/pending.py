@@ -189,6 +189,14 @@ class PendingTable:
     def discard(self, conn_id: str) -> Optional[PendingConn]:
         return self._items.pop(conn_id, None)
 
+    def count_for_client(self, client_id: str) -> int:
+        """该客户端当前进行中的转发数（含尚未配对的）。
+
+        配额判定要用它。方法体内部不含 ``await``，与 registry / mapping 一样
+        靠单事件循环的无抢占保证原子性。
+        """
+        return sum(1 for item in self._items.values() if item.client_id == client_id)
+
     def drain(self) -> List[PendingConn]:
         """取走全部挂起对象（关停时用）。"""
         items = list(self._items.values())

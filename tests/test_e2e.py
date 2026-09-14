@@ -21,19 +21,28 @@ tests/test_e2e.py —— 端到端链路验证
 14. 令牌错误                 403 → 客户端**只拨号一次**、状态 stopped、CONTROL_LOST(fatal=True)
 15. 令牌缺失                 同上；不配令牌的客户端不会陷入"每 60 秒撞一次墙"
 16. 容量已满                 503 属于**暂时性**失败 → 客户端继续退避重试，绝不当作 fatal
+17. 带宽限速                 服务端按客户端限速后，同样大小的响应要花明显更久，且字节不丢
+18. 并发配额                 单客户端在途数超上限 → 访客收到 429（不是 502），在途的那个不受影响
+19. 在线客户端数             ServerStats.clients_online 随上下线变化
+20. 运行期映射落盘           客户端 set_mapping 的变更**当场写进持久化文件**
+21. 重启后映射仍在           服务端重启（配置文件给的是另一个端口）→ 仍监听持久化文件里的端口
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import time
+from pathlib import Path
 from typing import Any, Dict, List
 
 import pytest
 
-from config import MappingRule
+from config import MappingRule, ServerConfig
 from localtonet.client.core import TunnelClient
 from localtonet.core.events import EventType
+from localtonet.server.core import TunnelServer
+from localtonet.server.mapping import FileMappingStore
 from tests.helpers import TunnelHarness, free_ports, http_request, http_stream_chunks
 
 # --------------------------------------------------------------------------- #
@@ -470,5 +479,166 @@ def test_client_capacity_limit_is_retriable_not_fatal() -> None:
                 await second.stop()
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------- #
+# 17 ~ 21：生产化（限流 / 配额 / 观测 / 持久化）
+# --------------------------------------------------------------------------- #
+
+
+def test_download_bandwidth_limit_slows_transfer_without_losing_bytes() -> None:
+    """限速要真的起作用，且**不许改变字节内容**。
+
+    对照测两条同大小的响应：不限速的那条是基线，限速的那条必须明显更慢。
+    只断言"慢了"是不够的——慢有可能是机器卡，有基线对照才说明是限速造成的。
+    """
+    rate = 64 * 1024  # 64 KB/s
+
+    def throttle(config: ServerConfig) -> None:
+        config.limits.per_client_download_bps = rate
+
+    async def scenario() -> None:
+        async with TunnelHarness() as baseline_harness:
+            started = time.monotonic()
+            baseline = await http_request(baseline_harness.public_port, "/big?kb=64", timeout=30.0)
+            baseline_cost = time.monotonic() - started
+        assert baseline.status == 200
+        assert len(baseline.body) == 64 * 1024
+
+        async with TunnelHarness(configure_server=throttle) as harness:
+            started = time.monotonic()
+            throttled = await http_request(harness.public_port, "/big?kb=64", timeout=30.0)
+            cost = time.monotonic() - started
+
+            assert harness.server is not None
+            # 桶初始有 16KB 的突发余量，剩余约 48KB 按 64KB/s 排 → 约 0.75s
+            assert cost >= 0.5, f"限速后只花了 {cost:.3f}s，限速没起作用"
+            assert cost > baseline_cost * 2, (
+                f"限速 {cost:.3f}s 与不限速 {baseline_cost:.3f}s 差距太小，无法证明是限速造成的"
+            )
+            assert harness.server.stats.throttled_seconds >= 0.4
+            assert harness.server.stats.bytes_download >= 64 * 1024
+
+        # 限速只影响节奏，不影响内容
+        assert throttled.status == 200
+        assert len(throttled.body) == 64 * 1024
+        assert throttled.body[:1024] == baseline.body[:1024]
+        assert throttled.body[-1024:] == baseline.body[-1024:]
+
+    asyncio.run(scenario())
+
+
+def test_per_client_concurrency_quota_returns_429() -> None:
+    """单客户端在途数超上限 → 访客收到 **429**（而不是 502），在途的那个不受影响。"""
+
+    def limit_to_one(config: ServerConfig) -> None:
+        config.limits.max_conns_per_client = 1
+
+    async def scenario() -> None:
+        async with TunnelHarness(configure_server=limit_to_one) as harness:
+            assert harness.server is not None and harness.client is not None
+            client_id = harness.client.client_id
+
+            slow = asyncio.create_task(
+                http_request(harness.public_port, "/stream?chunks=10&interval=0.1")
+            )
+            try:
+                await harness.wait_until(
+                    lambda: harness.server.pending.count_for_client(client_id) >= 1,  # type: ignore[union-attr]
+                    what="长请求进入在途",
+                )
+
+                rejected = await http_request(harness.public_port, "/echo?msg=nope")
+
+                assert rejected.status == 429
+                assert "Too Many Requests" in rejected.raw.decode("latin-1")
+                assert "concurrency limit" in rejected.text
+                assert "client_id" not in rejected.text, "对外不该泄露内部客户端标识"
+                assert harness.server.stats.requests_rejected == 1
+                # 配额拒绝不等于转发失败，两者必须分开计数
+                assert harness.server.stats.requests_failed == 0
+            finally:
+                response = await slow
+            assert response.status == 200, "已经在一半的那个请求不该被配额牵连"
+
+    asyncio.run(scenario())
+
+
+def test_stats_expose_online_client_count() -> None:
+    async def scenario() -> None:
+        async with TunnelHarness() as harness:
+            assert harness.server is not None and harness.client is not None
+            assert harness.server.stats.clients_online == 1
+            assert harness.server.snapshot()["stats"]["clients_online"] == 1
+
+            await harness.client.stop()
+            await harness.wait_offline()
+
+            assert harness.server.stats.clients_online == 0
+            # 累计计数不受影响，只动 gauge
+            assert harness.server.stats.clients_registered == 1
+
+    asyncio.run(scenario())
+
+
+def test_runtime_mapping_change_is_persisted(tmp_path: Path) -> None:
+    """客户端提交的映射变更要**当场落盘**，而不是等进程退出才写。"""
+    path = tmp_path / "mappings.json"
+
+    def configure(config: ServerConfig) -> None:
+        config.mapping_store.type = "file"
+        config.mapping_store.path = str(path)
+
+    async def scenario() -> None:
+        async with TunnelHarness(configure_server=configure) as harness:
+            assert harness.client is not None
+            extra_port = free_ports(1)[0]
+            keep = MappingRule(
+                public_port=harness.public_port, local_port=harness.backend.port, host="127.0.0.1"
+            )
+            added = MappingRule(
+                public_port=extra_port, local_port=harness.backend.port, host="127.0.0.1"
+            )
+
+            result = await harness.client.set_mapping([keep, added])
+            assert result["ok"] is True
+
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            assert sorted(item["public_port"] for item in persisted) == sorted(
+                [harness.public_port, extra_port]
+            )
+            assert (await http_request(extra_port, "/echo?msg=on-disk")).body == b"on-disk\n"
+
+    asyncio.run(scenario())
+
+
+def test_mapping_survives_server_restart(tmp_path: Path) -> None:
+    """重启后映射仍在：配置文件里给的是另一个端口，但以持久化文件为准。"""
+    persisted_port, seed_port = free_ports(2)
+    path = tmp_path / "mappings.json"
+    FileMappingStore(path).replace(
+        [MappingRule(public_port=persisted_port, local_port=8000, host="127.0.0.1")]
+    )
+
+    async def scenario() -> None:
+        config = ServerConfig(
+            name="restart-test",
+            mapping=[MappingRule(public_port=seed_port, local_port=8000, host="127.0.0.1")],
+        )
+        config.control.host = "127.0.0.1"
+        config.data.host = "127.0.0.1"
+        config.control.port, config.data.port = free_ports(2)
+        config.mapping_store.type = "file"
+        config.mapping_store.path = str(path)
+        config.validate()
+
+        server = TunnelServer(config)
+        await server.start()
+        try:
+            assert server.mapping.listen_ports() == [persisted_port]
+        finally:
+            await server.stop()
 
     asyncio.run(scenario())

@@ -5,8 +5,12 @@ localtonet.server.mapping —— 映射表与访客端口监听的生命周期
 两件事分开：
 
 ``MappingStore``（纯数据，**扩展点**）
-    映射表的读写。MVP 是内存实现；将来要"服务重启后映射还在"，
-    换成 JSON 文件 / SQLite / Redis 实现即可，``MappingManager`` 不用改。
+    映射表的读写。两个实现：:class:`InMemoryMappingStore`（默认）与
+    :class:`FileMappingStore`（JSON 持久化，重启后映射还在），
+    由 :func:`build_mapping_store` 按配置挑选，``MappingManager`` 不用改。
+
+    注意持久化带来的语义变化：store 里已有内容时，``MappingManager.start``
+    的 ``seed``（配置文件里的 mapping）**不再覆盖**它，只当首次种子。
 
 ``MappingManager``（生命周期）
     负责 ``asyncio.start_server`` 的起停。动态改映射不是"改个变量"就完了——
@@ -20,18 +24,29 @@ localtonet.server.mapping —— 映射表与访客端口监听的生命周期
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Awaitable, Callable, Dict, List, Optional, Sequence
 
-from config import MappingRule
+from config import ConfigError, MappingRule, MappingStoreConfig
 from localtonet.core.events import EventBus, EventType
 from localtonet.core.runtime import cancel_all, spawn
 from localtonet.errors import TunnelError
 from logging_setup import get_logger
 
-__all__ = ["MappingStore", "InMemoryMappingStore", "MappingDiff", "MappingManager"]
+__all__ = [
+    "MappingStore",
+    "InMemoryMappingStore",
+    "FileMappingStore",
+    "build_mapping_store",
+    "MappingDiff",
+    "MappingManager",
+]
 
 VisitorHandler = Callable[[asyncio.StreamReader, asyncio.StreamWriter, int], Awaitable[None]]
 """访客连接回调：``(reader, writer, public_port)``。
@@ -71,6 +86,140 @@ class InMemoryMappingStore(MappingStore):
 
     def replace(self, rules: Sequence[MappingRule]) -> None:
         self._rules = {rule.public_port: rule for rule in rules}
+
+
+DEFAULT_MAPPING_FILE = "mappings.json"
+"""``mapping_store.type=file`` 且没给 path 时的默认文件名（相对当前工作目录）。"""
+
+
+class FileMappingStore(MappingStore):
+    """JSON 文件持久化实现：服务端重启后映射表还在。
+
+    三条行为约定（都在 MEMORY.md 里记着，改之前先看这里）：
+
+    1. **谁说了算**：file 模式下以文件为准。配置文件里的 ``mapping`` 退化成
+       "首次种子"，只在文件不存在或内容为空时生效（见 :meth:`MappingManager.start`）。
+       否则每次重启都会把持久化的内容冲掉，持久化等于没做。
+    2. **加载失败要 fail fast**：文件损坏时直接抛错、拒绝启动，绝不静默退回内存。
+       静默降级是最坏的失败模式——运维会以为持久化在工作，实际每次重启都丢映射。
+    3. **写盘失败要降级**：磁盘满 / 没权限时记 ERROR 日志、继续用内存态，
+       绝不因为"写不进文件"就让一次映射变更整体失败。原因留在 :attr:`persist_error`。
+
+    写盘用"同目录临时文件 + ``os.replace``"：同卷替换是原子的，
+    不会出现"写了一半"的文件被下一次启动读到（Windows 上同样成立）。
+    """
+
+    def __init__(self, path: str | os.PathLike[str], *, logger: Optional[logging.Logger] = None) -> None:
+        self._path = Path(path)
+        self._log = logger or get_logger("server.mapping")
+        self._persist_error = ""
+        self._rules: Dict[int, MappingRule] = self._load()
+        if self._rules:
+            self._log.info("已从 %s 载入 %d 条映射", self._path, len(self._rules))
+
+    # ------------------------------------------------------------------ #
+    # 查询
+    # ------------------------------------------------------------------ #
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    @property
+    def persist_error(self) -> str:
+        """最近一次写盘失败的原因，空串表示一切正常。"""
+        return self._persist_error
+
+    def all(self) -> List[MappingRule]:
+        return [self._rules[port] for port in sorted(self._rules)]
+
+    def get(self, public_port: int) -> Optional[MappingRule]:
+        return self._rules.get(public_port)
+
+    # ------------------------------------------------------------------ #
+    # 写入
+    # ------------------------------------------------------------------ #
+
+    def replace(self, rules: Sequence[MappingRule]) -> None:
+        self._rules = {rule.public_port: rule for rule in rules}
+        self._persist()
+
+    # ------------------------------------------------------------------ #
+    # 内部
+    # ------------------------------------------------------------------ #
+
+    def _load(self) -> Dict[int, MappingRule]:
+        if not self._path.is_file():
+            self._log.debug("映射文件 %s 不存在，按空表启动（首次播种时创建）", self._path)
+            return {}
+        try:
+            raw = self._path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ConfigError(f"无法读取映射文件 {self._path}：{exc}") from exc
+        if not raw.strip():
+            return {}
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ConfigError(
+                f"映射文件 {self._path} 不是合法 JSON：{exc}。"
+                f"可删掉该文件以回退到配置文件里的 mapping，或把 mapping_store.type 改回 memory"
+            ) from exc
+        if not isinstance(data, list):
+            raise ConfigError(
+                f"映射文件 {self._path} 的顶层必须是数组，实际为 {type(data).__name__}。"
+                f"可删掉该文件以回退到配置文件里的 mapping，或把 mapping_store.type 改回 memory"
+            )
+
+        rules: Dict[int, MappingRule] = {}
+        for index, item in enumerate(data):
+            if not isinstance(item, dict):
+                raise ConfigError(f"映射文件 {self._path} 的第 {index} 项必须是对象")
+            rule = MappingRule.from_dict(item, f"{self._path.name}[{index}]")
+            if rule.public_port in rules:
+                raise ConfigError(f"映射文件 {self._path} 里 public_port={rule.public_port} 重复")
+            rules[rule.public_port] = rule
+        return rules
+
+    def _persist(self) -> None:
+        payload = [rule.to_dict() for rule in self.all()]
+        tmp = self._path.with_name(self._path.name + ".tmp")
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self._path)
+        except OSError as exc:
+            self._persist_error = str(exc)
+            self._log.error(
+                "映射表写入 %s 失败：%s（内存中的映射仍然生效，只是没能持久化）", self._path, exc
+            )
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+            return
+        self._persist_error = ""
+        self._log.debug("映射表已写入 %s（%d 条）", self._path, len(payload))
+
+    def __repr__(self) -> str:
+        return f"FileMappingStore(path={str(self._path)!r}, rules={len(self._rules)})"
+
+
+def build_mapping_store(
+    config: MappingStoreConfig,
+    *,
+    logger: Optional[logging.Logger] = None,
+) -> MappingStore:
+    """按配置挑存储后端。
+
+    服务端只认这一个入口，将来加 SQLite / Redis 实现也不必改调用方。
+    """
+    if config.type == "file":
+        return FileMappingStore(config.path.strip() or DEFAULT_MAPPING_FILE, logger=logger)
+    return InMemoryMappingStore()
 
 
 @dataclass
@@ -160,15 +309,35 @@ class MappingManager:
     # 生命周期
     # ------------------------------------------------------------------ #
 
-    async def start(self, rules: Sequence[MappingRule]) -> MappingDiff:
-        """首次启动：按给定规则起全部监听。任一起不来则整体失败，不留在半启动状态。"""
+    async def start(self, seed: Sequence[MappingRule]) -> MappingDiff:
+        """首次启动：按**生效的**规则起全部监听。任一起不来则整体失败，不留在半启动状态。
+
+        ``seed`` 是配置文件里的 ``mapping``，但它**只在 store 为空时生效**：
+        store 里已经有内容（例如从持久化文件载入的映射）时以 store 为准。
+
+        这条"store 优先"是持久化能成立的前提——若照旧用 seed 覆盖 store，
+        每次重启都会把持久化下来的映射冲掉，持久化就等于没做。
+        store 与 seed 不一致时会打 WARNING，免得使用者以为改了配置文件却没反应。
+        """
         previous = self._store.all()
-        self._store.replace(rules)
-        diff = MappingDiff(added=[rule.public_port for rule in rules], removed=[rule.public_port for rule in previous])
+        effective = list(previous) or list(seed)
+        if previous and [rule.to_dict() for rule in previous] != [rule.to_dict() for rule in seed]:
+            self._log.warning(
+                "已存在的映射表（%d 条）优先于配置文件里的 mapping（%d 条）：以已有内容为准，"
+                "配置文件仅在映射表为空时作为初始种子",
+                len(previous),
+                len(seed),
+            )
+
+        self._store.replace(effective)
+        diff = MappingDiff(
+            added=[rule.public_port for rule in effective],
+            removed=[rule.public_port for rule in previous],
+        )
 
         started: List[int] = []
         try:
-            for rule in rules:
+            for rule in effective:
                 await self._listen(rule)
                 started.append(rule.public_port)
         except OSError as exc:

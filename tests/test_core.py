@@ -25,9 +25,10 @@ from localtonet.core.backoff import Backoff
 from localtonet.core.dispatcher import MessageDispatcher, handler
 from localtonet.core.events import EventBus, EventType
 from localtonet.core.heartbeat import HeartbeatTask, Watchdog
-from localtonet.core.pipe import pipe_both
-from localtonet.errors import AuthError
+from localtonet.core.pipe import DOWNLOAD_DIRECTION, UPLOAD_DIRECTION, pipe_both
+from localtonet.errors import AuthError, QuotaExceededError, RegistrationError
 from localtonet.server.auth import NoneAuthenticator, TokenAuthenticator, build_authenticator
+from localtonet.server.core import _HTTP_PHRASES, ServerStats, TunnelServer
 from localtonet.server.pending import PendingConn, PendingTable
 from localtonet.server.registry import ClientRegistry, ClientSession
 from protocol import MsgType
@@ -483,7 +484,12 @@ def test_watchdog_swallows_expire_errors() -> None:
 
         watchdog = Watchdog(interval=0.02, collect=lambda: ["x"], expire=expire)
         task = asyncio.create_task(watchdog.run())
-        await asyncio.sleep(0.05)
+        # 等"条件达成"而不是固定睡一小会儿：Windows 的 sleep 粒度约 15ms，
+        # 整机跑测试时事件循环被抢占会让 0.05s 只够跑一轮巡检，断言随机失败。
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 2.0
+        while len(attempts) < 2 and loop.time() < deadline:
+            await asyncio.sleep(0.01)
         watchdog.stop()
         await asyncio.wait_for(task, timeout=1.0)
 
@@ -533,3 +539,180 @@ def test_tunnel_error_message_carries_no_code_prefix() -> None:
 def test_mapping_rule_roundtrip() -> None:
     rule = MappingRule(public_port=9028, local_port=8000, host="127.0.0.1", remark="demo")
     assert MappingRule.from_dict(rule.to_dict()) == rule
+
+
+# --------------------------------------------------------------------------- #
+# 限速钩子：挂在 pipe_both 的内层写入循环上
+# --------------------------------------------------------------------------- #
+
+
+class _CountingLimiter:
+    """记录每次取配额调用的假限速器。"""
+
+    def __init__(self) -> None:
+        self.calls: List[Tuple[str, str, int]] = []
+
+    async def wait(self, key: str, direction: str, amount: int) -> float:
+        self.calls.append((key, direction, amount))
+        return 0.25
+
+
+def test_pipe_both_passes_every_chunk_through_the_rate_limit_hook() -> None:
+    """每个 chunk 写入前都要过桶，且 key / 方向如实透传、等待时间计入统计。"""
+
+    async def scenario() -> None:
+        a_proxy, a_peer = socket.socketpair()
+        b_proxy, b_peer = socket.socketpair()
+        a_reader, a_writer = await _wrap(a_proxy)
+        b_reader, b_writer = await _wrap(b_proxy)
+        a_peer_reader, a_peer_writer = await _wrap(a_peer)
+        b_peer_reader, b_peer_writer = await _wrap(b_peer)
+
+        limiter = _CountingLimiter()
+        pipe_task = asyncio.create_task(
+            pipe_both(
+                a_reader,
+                a_writer,
+                b_reader,
+                b_writer,
+                label="rate-limit",
+                rate_limit=limiter,
+                limit_key="client-x",
+            )
+        )
+        try:
+            b_peer_writer.write(b"from-b-longer")
+            await b_peer_writer.drain()
+            assert await asyncio.wait_for(a_peer_reader.readexactly(13), timeout=3.0) == b"from-b-longer"
+
+            a_peer_writer.write(b"from-a")
+            await a_peer_writer.drain()
+            assert await asyncio.wait_for(b_peer_reader.readexactly(6), timeout=3.0) == b"from-a"
+
+            a_peer_writer.close()
+            assert await asyncio.wait_for(b_peer_reader.read(), timeout=3.0) == b""
+            stats = await asyncio.wait_for(pipe_task, timeout=3.0)
+        finally:
+            for writer in (a_peer_writer, b_peer_writer):
+                writer.close()
+            if not pipe_task.done():
+                pipe_task.cancel()
+                await asyncio.gather(pipe_task, return_exceptions=True)
+
+        assert sorted(limiter.calls) == sorted(
+            [("client-x", UPLOAD_DIRECTION, 6), ("client-x", DOWNLOAD_DIRECTION, 13)]
+        ), "钩子必须拿到正确的 key、方向与字节数"
+        assert stats.throttled == pytest.approx(0.5)
+        # 限速不能破坏既有统计
+        assert stats.upload == 6
+        assert stats.download == 13
+        assert stats.total == 19
+
+    asyncio.run(scenario())
+
+
+def test_pipe_both_without_hook_reports_zero_throttle() -> None:
+    """不传限速钩子时零开销、统计为 0——默认配置走的必须是这条路。"""
+
+    async def scenario() -> None:
+        a_proxy, a_peer = socket.socketpair()
+        b_proxy, b_peer = socket.socketpair()
+        a_reader, a_writer = await _wrap(a_proxy)
+        b_reader, b_writer = await _wrap(b_proxy)
+        b_peer_reader, b_peer_writer = await _wrap(b_peer)
+        a_peer.close()
+
+        stats = await asyncio.wait_for(pipe_both(a_reader, a_writer, b_reader, b_writer), timeout=3.0)
+        assert stats.throttled == 0.0
+        assert stats.total == 0
+
+        b_peer_writer.close()
+        assert await asyncio.wait_for(b_peer_reader.read(), timeout=3.0) == b""
+
+    asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------- #
+# 并发配额：在途计数
+# --------------------------------------------------------------------------- #
+
+
+def test_pending_table_counts_inflight_per_client() -> None:
+    async def scenario() -> None:
+        table = PendingTable()
+        for index, client_id in enumerate(("client-a", "client-a", "client-b")):
+            table.create(
+                PendingConn(
+                    conn_id=f"conn-{index}",
+                    public_port=9000 + index,
+                    local_port=8000,
+                    client_id=client_id,
+                    visitor_reader=None,  # type: ignore[arg-type]
+                    visitor_writer=None,  # type: ignore[arg-type]
+                )
+            )
+
+        assert table.count_for_client("client-a") == 2
+        assert table.count_for_client("client-b") == 1
+        assert table.count_for_client("nobody") == 0
+
+        table.discard("conn-0")
+        assert table.count_for_client("client-a") == 1
+
+    asyncio.run(scenario())
+
+
+def test_quota_exceeded_is_429_and_retriable() -> None:
+    """配额超限是**暂时性**失败：既不是 403，也不该被当成 fatal。"""
+    error = QuotaExceededError("客户端 client-a 的并发转发数已达上限 1")
+
+    assert error.code == 429
+    assert error.message == "客户端 client-a 的并发转发数已达上限 1"
+    assert str(error) == "[429] 客户端 client-a 的并发转发数已达上限 1"
+
+    retriable = RegistrationError("超出配额", code=429)
+    assert retriable.is_fatal is False
+    assert RegistrationError("容量满", code=503).is_fatal is False
+    assert RegistrationError("凭据不对", code=403).is_fatal is True
+
+
+def test_http_phrases_cover_429() -> None:
+    """少了这一条，访客会收到 ``500 Error`` 而不是 ``429 Too Many Requests``。"""
+    assert _HTTP_PHRASES[429] == "Too Many Requests"
+
+
+def test_reply_http_renders_429_status_line() -> None:
+    class _FakeWriter:
+        def __init__(self) -> None:
+            self.data = b""
+
+        def write(self, chunk: bytes) -> None:
+            self.data += chunk
+
+        async def drain(self) -> None:
+            return None
+
+    class _FakeReader:
+        async def read(self, n: int = -1) -> bytes:
+            return b""
+
+    async def scenario() -> None:
+        writer = _FakeWriter()
+        await TunnelServer._reply_http(  # type: ignore[arg-type]
+            _FakeReader(), writer, 429, "Per-client concurrency limit reached"
+        )
+
+        head, _, body = writer.data.partition(b"\r\n\r\n")
+        assert head.startswith(b"HTTP/1.1 429 Too Many Requests")
+        assert body == b"429 Per-client concurrency limit reached\n"
+
+    asyncio.run(scenario())
+
+
+def test_server_stats_expose_quota_and_gauge_fields() -> None:
+    payload = ServerStats().to_dict()
+
+    assert payload["requests_rejected"] == 0
+    assert payload["clients_online"] == 0
+    assert payload["throttled_seconds"] == 0.0
+    assert payload["clients_registered"] == 0

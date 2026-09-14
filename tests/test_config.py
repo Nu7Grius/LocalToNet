@@ -14,14 +14,22 @@ import pytest
 from config import (
     ClientConfig,
     ConfigError,
+    LimitsConfig,
     LogConfig,
     MappingRule,
+    MappingStoreConfig,
     ServerConfig,
     Timeouts,
 )
 from localtonet.errors import TunnelError
 
 ROOT = Path(__file__).resolve().parent.parent
+
+_QUOTA_FIELDS = (
+    "max_conns_per_client",
+    "per_client_upload_bps",
+    "per_client_download_bps",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -175,3 +183,104 @@ def test_roundtrip_to_dict_stays_loadable() -> None:
 
 def test_config_error_is_a_tunnel_error() -> None:
     assert issubclass(ConfigError, TunnelError)
+
+
+# --------------------------------------------------------------------------- #
+# limits：容量（>0）与配额（>=0）是两类字段
+# --------------------------------------------------------------------------- #
+
+
+def test_quota_fields_default_to_unlimited() -> None:
+    limits = LimitsConfig()
+    for name in _QUOTA_FIELDS:
+        assert getattr(limits, name) == 0, f"{name} 默认必须是不限（0）"
+    limits.validate()
+
+
+@pytest.mark.parametrize("field", _QUOTA_FIELDS)
+def test_quota_field_accepts_zero_but_rejects_negative(field: str) -> None:
+    LimitsConfig(**{field: 0}).validate()
+
+    with pytest.raises(ConfigError, match=field):
+        LimitsConfig(**{field: -1}).validate()
+
+
+@pytest.mark.parametrize("field", ("max_msg_len", "max_clients", "max_mappings"))
+def test_capacity_field_rejects_zero(field: str) -> None:
+    """容量字段与配额字段语义不同：容量为 0 等于"什么都收不了"，必须报错。"""
+    with pytest.raises(ConfigError, match="必须为正数"):
+        LimitsConfig(**{field: 0}).validate()
+
+
+def test_quota_field_must_be_int() -> None:
+    with pytest.raises(ConfigError, match="limits.per_client_upload_bps 必须是整数"):
+        LimitsConfig.from_dict({"per_client_upload_bps": "64k"})
+
+
+def test_unknown_limit_field_is_rejected() -> None:
+    with pytest.raises(ConfigError, match="未知字段"):
+        LimitsConfig.from_dict({"per_client_bandwidth": 1024})
+
+
+def test_limits_block_is_loaded_from_server_config() -> None:
+    data = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+    data["limits"] = {"max_clients": 4, "max_conns_per_client": 8, "per_client_upload_bps": 4096}
+
+    cfg = ServerConfig.from_dict(data)
+
+    assert cfg.limits.max_conns_per_client == 8
+    assert cfg.limits.per_client_upload_bps == 4096
+
+
+# --------------------------------------------------------------------------- #
+# mapping_store
+# --------------------------------------------------------------------------- #
+
+
+def test_mapping_store_defaults_to_memory() -> None:
+    assert ServerConfig(mapping=[MappingRule(9028, 8000)]).mapping_store.type == "memory"
+
+
+def test_mapping_store_file_requires_path() -> None:
+    with pytest.raises(ConfigError, match="mapping_store.path"):
+        MappingStoreConfig(type="file").validate()
+
+
+def test_mapping_store_rejects_unknown_type() -> None:
+    with pytest.raises(ConfigError, match="mapping_store.type"):
+        MappingStoreConfig(type="sqlite").validate()
+
+
+def test_mapping_store_type_is_normalized() -> None:
+    assert MappingStoreConfig.from_dict({"type": "  FILE  ", "path": "m.json"}).type == "file"
+
+
+def test_mapping_store_unknown_field_is_rejected() -> None:
+    with pytest.raises(ConfigError, match="未知字段"):
+        MappingStoreConfig.from_dict({"type": "file", "path": "m.json", "flush": True})
+
+
+def test_mapping_store_from_server_config_dict() -> None:
+    data = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+    data["mapping_store"] = {"type": "file", "path": "data/mappings.json"}
+
+    cfg = ServerConfig.from_dict(data)
+
+    assert cfg.mapping_store.type == "file"
+    assert cfg.mapping_store.path == "data/mappings.json"
+
+
+def test_mapping_store_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LOCALTONET_MAPPING_STORE", "FILE")
+    monkeypatch.setenv("LOCALTONET_MAPPING_STORE_PATH", "from-env.json")
+
+    cfg = ServerConfig.from_env(ServerConfig(mapping=[MappingRule(9028, 8000)]))
+
+    assert cfg.mapping_store.type == "file"
+    assert cfg.mapping_store.path == "from-env.json"
+
+
+def test_demo_config_keeps_memory_store() -> None:
+    """演示配置不能被悄悄切成持久化——那会改变"改配置就生效"的既有直觉。"""
+    cfg = ServerConfig.from_file(ROOT / "config.json")
+    assert cfg.mapping_store.type == "memory"

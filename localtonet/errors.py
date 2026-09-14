@@ -16,6 +16,7 @@ __all__ = [
     "NoClientOnline",
     "NoMappingError",
     "BackendConnectError",
+    "QuotaExceededError",
     "RegistrationError",
 ]
 
@@ -91,12 +92,29 @@ class BackendConnectError(TunnelError):
         super().__init__(f"无法连接内网后端 {host}:{port}{detail}")
 
 
+class QuotaExceededError(TunnelError):
+    """某个客户端超出了自己的配额（并发数 / 带宽）。
+
+    与 ``503``（服务端整体容量满）**语义不同，不能合并**：
+
+    * ``503`` = "服务端没位置了"，运维该扩容；
+    * ``429`` = "你这个客户端跑得太满"，该限流或让客户端收敛。
+
+    混用会让运维看状态码分不清该扩容还是该限人。
+    """
+
+    code = 429
+
+
 class RegistrationError(TunnelError):
     """客户端向服务端注册失败。
 
     ``code`` 取自服务端 ``register_ack`` 里的 ``code`` 字段。
     ``403`` 视为**永久性失败**（凭据不对），客户端应当停止重试——
     否则会陷入"每 60 秒被拒一次"的无意义循环。
+
+    其余 ``code`` 一律按**暂时性失败**处理（继续退避重试），其中 ``503``（容量满）
+    与 ``429``（配额超限）都属于"回头可能就好了"，绝不能与 ``403`` 混同。
     """
 
     code = 500
