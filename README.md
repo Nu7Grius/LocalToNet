@@ -497,7 +497,7 @@ LocalToNet/
 │       ├── viewmodel.py      邮筒消息 → 表格与状态栏（纯逻辑）
 │       └── app.py            窗口、表格、按钮、状态栏、日志面板
 ├── examples/demo_backend.py  演示用内网 HTTP 服务
-└── tests/                    281 项测试（单测 + 端到端 + GUI + 命令行 + TLS + 访客端 TLS）
+└── tests/                    335 项测试（单测 + 端到端 + GUI + 命令行 + 鉴权 + TLS + 访客端 TLS）
 ```
 
 ## 协议
@@ -660,9 +660,9 @@ python -m pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-当前 **281 项全部通过**（test_protocol 17 / test_config 56 / test_core 40 / test_e2e 21 /
-test_server_cli 21 / test_client_cli 5 / test_limiter 12 / test_mapping_store 21 /
-test_tls 10 / test_visitor_tls 13 / test_gui_model 49 / test_gui_bridge 10 / test_gui_controller 6），
+当前 **335 项全部通过**（test_config 63 / test_gui_model 50 / test_core 40 / test_auth_tokens 36 /
+test_server_cli 29 / test_e2e 21 / test_mapping_store 21 / test_protocol 17 / test_visitor_tls 13 /
+test_limiter 12 / test_gui_bridge 10 / test_tls 10 / test_client_cli 7 / test_gui_controller 6），
 其中 21 项是真实拉起三件套、走真实 TCP 的端到端测试：
 
 | 用例 | 验证内容 |
@@ -683,7 +683,8 @@ test_tls 10 / test_visitor_tls 13 / test_gui_model 49 / test_gui_bridge 10 / tes
 | 令牌错误 | `403` → 客户端**只拨号一次**、状态 `stopped`、`CONTROL_LOST(fatal=True)` |
 | 令牌缺失 | 同上，症状与令牌错误完全一致 |
 | 容量已满 | `503` **不**被当成 fatal，客户端继续退避重试；已在线客户端不受影响 |
-| 带宽限流 | 限速后同一份数据的耗时**明显长于**不限速基线，且字节数一个不少 || 并发配额 | 打满 `max_conns_per_client` 后新请求回 `429`；在途请求照常返回 200 |
+| 带宽限流 | 限速后同一份数据的耗时**明显长于**不限速基线，且字节数一个不少 |
+| 并发配额 | 打满 `max_conns_per_client` 后新请求回 `429`；在途请求照常返回 200 |
 | 在线数观测 | `stats.clients_online` 随客户端上下线增减 |
 | 运行期持久化 | `set_mapping` 后映射文件立刻出现新端口 |
 | 重启后存活 | 换一个 `TunnelServer` 实例重启，仍监听上次持久化的端口，而 `config.json` 里的端口未生效 |
@@ -783,4 +784,4 @@ GUI 相关的三项测试（`test_gui_model` / `test_gui_bridge` / `test_gui_con
 - 访客端口**不做运行时协议探测**：服务端在配对前不读访客一个字节（纯透传），
   所以"明文请求打到了 TLS 端口"这类错配只能靠启动日志的逐端口状态提示，不会自动纠正
 
-后续计划：服务端侧管理界面 → 按请求的带宽统计与限流粒度细化 → 令牌热轮换（免重启）。
+后续计划：服务端侧管理界面 → 按请求的带宽统计与限流粒度细化。
