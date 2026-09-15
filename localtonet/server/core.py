@@ -44,7 +44,12 @@ from localtonet.core.limiter import ClientRateLimiter
 from localtonet.core.pipe import close_write_side, close_writer, pipe_both
 from localtonet.core.rules import parse_mapping, parse_ports
 from localtonet.core.runtime import cancel_all, peer_name, spawn
-from localtonet.core.tls import build_server_context, describe_server_tls
+from localtonet.core.tls import (
+    build_server_context,
+    build_visitor_context,
+    describe_server_tls,
+    describe_visitor_tls,
+)
 from localtonet.errors import AuthError, QuotaExceededError, TunnelError
 from localtonet.server.auth import Authenticator, build_authenticator
 from localtonet.server.mapping import (
@@ -118,6 +123,7 @@ class TunnelServer:
         authenticator: Optional[Authenticator] = None,
         registry: Optional[ClientRegistry] = None,
         mapping_store: Optional[MappingStore] = None,
+        visitor_plain_override: bool = False,
     ) -> None:
         self._config = config
         self._log = logger or get_logger("server")
@@ -127,6 +133,9 @@ class TunnelServer:
         # 数据通道是"每个请求一条 TCP"，每条都新建 context 会让 TLS 1.3 的
         # 会话票据缓存彻底失效，等于每个请求都付一次完整握手。
         self._tls = build_server_context(config.tls, logger=self._log)
+        # 访客端口另起一份上下文（证书独立、绝不回落）。同样只建一次：
+        # 开关热切时只换"用不用"，不重建 context。
+        self._visitor_tls = build_visitor_context(config.tls, logger=self._log)
         self._registry = registry or ClientRegistry(logger=self._log)
         self._pending = PendingTable(logger=self._log)
         self._limiter = self._build_limiter(config.limits)
@@ -137,6 +146,10 @@ class TunnelServer:
             host=config.control.host,
             logger=self._log,
             events=self._events,
+            visitor_tls=self._visitor_tls,
+            visitor_default=config.tls.visitor_enabled,
+            visitor_forced_plain=visitor_plain_override,
+            visitor_handshake_timeout=config.tls.handshake_timeout,
         )
         self._dispatcher = MessageDispatcher.from_object(self, logger=self._log)
         self._stats = ServerStats()
@@ -166,6 +179,8 @@ class TunnelServer:
             self._auth.name,
             describe_server_tls(cfg.tls),
         )
+        # 访客端口 TLS 逐端口状态由 MappingManager._listen 打；这里只说全局默认与证书有无
+        self._log.info("%s", describe_visitor_tls(cfg.tls))
 
         await self._mapping.start(cfg.mapping)
 
@@ -526,7 +541,9 @@ class TunnelServer:
             diff = await self._mapping.apply(rules)
         except (ConfigError, TunnelError) as exc:
             self._log.warning("客户端 %s 提交的映射更新被拒绝：%s", session.client_id, exc)
-            await self._send(session, make_msg(MsgType.MAPPING_RESULT, ok=False, msg=str(exc)))
+            # 回执里用 exc.message（不带 [code] 前缀），只有日志才用 str(exc)——
+            # 回执另有独立的 code 语义，塞前缀会出现 "[500] [500] ..." 叠字
+            await self._send(session, make_msg(MsgType.MAPPING_RESULT, ok=False, msg=exc.message))
             return
 
         await self._send(

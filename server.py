@@ -11,6 +11,10 @@ server.py —— 服务端入口（公网侧）
     python server.py --no-auth                # 强制关闭鉴权（覆盖 JSON / 环境变量）
     python server.py --mapping-store file --mapping-store-path mappings.json
                                               # 映射持久化，重启后映射还在
+    python server.py --visitor-tls-cert cert.pem --visitor-tls-key key.pem
+                                              # 访客端口（公网入口那一跳）也做 TLS 终止；
+                                              # 证书独立于 --tls-cert，绝不回落
+    python server.py --no-visitor-tls        # 强制访客端口全明文（覆盖逐端口 tls 设置）
 
 配置文件格式见 ``config.json``；所有字段都可用 ``LOCALTONET_`` 前缀的环境变量覆盖，
 命令行参数的优先级最高（默认值 < JSON < 环境变量 < 命令行）。
@@ -105,6 +109,26 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="路径",
         help="校验客户端证书用的 CA；给出即要求客户端出示证书（双向认证 mTLS）",
     )
+    # 访客端口 TLS（公网访客 ↔ 服务端这一跳）。与上面控制/数据两跳的开关相互独立，
+    # 且**证书独立、绝不回落**——隧道自签证书跟公网入口的证书是两回事。
+    # 组内互斥的写法照抄 --tls-cert/--no-tls：key 必须能跟 cert 同时出现，
+    # 所以只有 cert 与逃生门进互斥组。
+    visitor_tls_group = parser.add_mutually_exclusive_group()
+    visitor_tls_group.add_argument(
+        "--visitor-tls-cert",
+        metavar="路径",
+        help="访客端口证书链（PEM），与 --visitor-tls-key 配套；给出即把**全局默认**打开"
+        "（未显式表态的端口全部变 TLS）。只想给个别端口开，请把证书写进 config.json 的 tls 块"
+        "并保持 visitor_enabled=false，用 mapping[].tls 逐端口表态",
+    )
+    visitor_tls_group.add_argument(
+        "--no-visitor-tls",
+        action="store_true",
+        help="强制所有访客端口明文，覆盖配置里的 visitor_enabled 与逐端口 tls（本地演示用）",
+    )
+    parser.add_argument(
+        "--visitor-tls-key", metavar="路径", help="访客端口私钥（PEM），与 --visitor-tls-cert 配套"
+    )
     parser.add_argument("--log-level", help="日志级别（DEBUG/INFO/WARNING/ERROR）")
     parser.add_argument("--log-file", help="同时写入日志文件")
     return parser
@@ -170,6 +194,21 @@ def load_config(args: argparse.Namespace) -> ServerConfig:
         config.tls.client_ca = args.tls_client_ca
         config.tls.require_client_cert = True
         config.tls.enabled = True
+    # 访客端口 TLS：--no-visitor-tls 是逃生门（一票否决，连逐端口 tls=true 都压过去）；
+    # 给出证书路径即隐式打开**全局默认**。default 全 None，否则区分不出"没给"。
+    # 注意 per-port 的 mapping[].tls 只有 JSON 一条路，CLI 不做（同 limits 与 mapping 的先例）。
+    if args.no_visitor_tls:
+        config.tls.visitor_enabled = False
+    if args.visitor_tls_cert is not None:
+        if not args.visitor_tls_cert.strip():
+            raise ConfigError("--visitor-tls-cert 不能为空；若要关闭访客 TLS 请改用 --no-visitor-tls")
+        config.tls.visitor_cert = args.visitor_tls_cert
+        config.tls.visitor_enabled = True
+    if args.visitor_tls_key is not None:
+        if not args.visitor_tls_key.strip():
+            raise ConfigError("--visitor-tls-key 不能为空")
+        config.tls.visitor_key = args.visitor_tls_key
+        config.tls.visitor_enabled = True
     if args.log_level:
         config.log.level = args.log_level.upper()
     if args.log_file:
@@ -179,10 +218,10 @@ def load_config(args: argparse.Namespace) -> ServerConfig:
     return config
 
 
-async def serve(config: ServerConfig) -> int:
+async def serve(config: ServerConfig, *, visitor_plain_override: bool = False) -> int:
     log = get_logger("server.cli")
     try:
-        server = TunnelServer(config)
+        server = TunnelServer(config, visitor_plain_override=visitor_plain_override)
     except ConfigError as exc:
         # 持久化映射文件损坏这类问题归到"配置错误"，与命令行解析失败同一个退出码
         print(f"配置错误：{exc}", file=sys.stderr)
@@ -193,7 +232,14 @@ async def serve(config: ServerConfig) -> int:
 
     server.events.once(EventType.SERVER_STARTED, announce)
 
-    await server.start()
+    try:
+        await server.start()
+    except ConfigError as exc:
+        # 逐端口 tls=true 却没配访客证书这类问题，要等映射表真正加载完
+        # （可能来自 mappings.json）才查得出来，所以只能在启动阶段拦。
+        # 此刻一个访客监听都没起，退出也是干净的。
+        print(f"配置错误：{exc}", file=sys.stderr)
+        return 2
     try:
         await server.serve_forever()
     except asyncio.CancelledError:
@@ -213,7 +259,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     setup_logging(config.log.level, config.log.file)
     try:
-        return asyncio.run(serve(config))
+        return asyncio.run(serve(config, visitor_plain_override=args.no_visitor_tls))
     except KeyboardInterrupt:
         print("\n已收到中断信号，正在退出…")
         return 0

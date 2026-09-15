@@ -340,3 +340,94 @@ def test_demo_config_keeps_tls_disabled() -> None:
     """演示配置不能悄悄开 TLS——那会让本地 demo 突然要证书。"""
     cfg = ServerConfig.from_file(ROOT / "config.json")
     assert cfg.tls.enabled is False
+
+
+# --------------------------------------------------------------------------- #
+# 访客端口 TLS（per-port 开关，默认明文）
+# --------------------------------------------------------------------------- #
+
+
+def test_visitor_tls_defaults_to_plaintext() -> None:
+    """三件套默认值：不开、无证书。且"关着又给了证书"是合法的（per-port 用法）。"""
+    cfg = ServerTlsConfig()
+
+    assert cfg.visitor_enabled is False
+    assert cfg.visitor_cert == ""
+    assert cfg.visitor_key == ""
+    cfg.validate()  # 什么都不配 → 合法
+
+    # 给了证书但没把全局默认打开：这是"默认明文、个别端口显式开"的正规用法，不能报错
+    ServerTlsConfig(visitor_cert="vc.pem", visitor_key="vk.pem").validate()
+
+
+def test_visitor_cert_and_key_must_be_paired_at_config_layer() -> None:
+    """证书/私钥必须成对——只给一个就是"配了一半"，必须启动失败而不是静默明文。"""
+    with pytest.raises(ConfigError, match="成对"):
+        ServerTlsConfig(visitor_cert="vc.pem").validate()
+    with pytest.raises(ConfigError, match="成对"):
+        ServerTlsConfig(visitor_key="vk.pem").validate()
+    with pytest.raises(ConfigError, match="visitor_enabled"):
+        ServerTlsConfig(visitor_enabled=True).validate()
+
+
+def test_visitor_tls_env_applies_and_does_not_touch_control_data_tls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """环境变量层：给出证书即隐式打开**访客默认**，但绝不碰 ``tls.enabled``。"""
+    monkeypatch.setenv("LOCALTONET_TLS_VISITOR_CERT", "vc.pem")
+    monkeypatch.setenv("LOCALTONET_TLS_VISITOR_KEY", "vk.pem")
+    cfg = ServerConfig.from_env(ServerConfig(mapping=[MappingRule(9028, 8000)]))
+
+    assert cfg.tls.visitor_cert == "vc.pem"
+    assert cfg.tls.visitor_key == "vk.pem"
+    assert cfg.tls.visitor_enabled is True
+    assert cfg.tls.enabled is False, "访客端口 TLS 与控制/数据两跳是两个独立开关"
+
+    # bool("false") is True 这个坑必须拦死
+    monkeypatch.setenv("LOCALTONET_TLS_VISITOR_ENABLED", "false")
+    cfg2 = ServerConfig.from_env(ServerConfig(mapping=[MappingRule(9028, 8000)]))
+    assert cfg2.tls.visitor_enabled is False
+
+
+def test_visitor_tls_unknown_field_is_rejected() -> None:
+    with pytest.raises(ConfigError, match="未知字段"):
+        ServerTlsConfig.from_dict({"visitor_ca": "ca.pem"})
+
+
+def test_mapping_rule_tls_three_state_parsing() -> None:
+    """``tls`` 只接受 null / true / false；字符串 "true" 必须 fail fast。"""
+    where = {"public_port": 9028, "local_port": 8000}
+
+    assert MappingRule.from_dict(dict(where)).tls is None, "缺字段＝没表态"
+    assert MappingRule.from_dict(dict(where, tls=None)).tls is None
+    assert MappingRule.from_dict(dict(where, tls=True)).tls is True
+    assert MappingRule.from_dict(dict(where, tls=False)).tls is False
+
+    with pytest.raises(ConfigError, match="布尔"):
+        MappingRule.from_dict(dict(where, tls="true"))
+
+
+def test_mapping_rule_roundtrip_omits_unspecified_tls() -> None:
+    """``tls=None`` 不落盘、显式值原样往返——回滚安全的根据就在这条。"""
+    plain = MappingRule(9028, 8000)
+    assert "tls" not in plain.to_dict()
+    assert MappingRule.from_dict(plain.to_dict()).tls is None
+
+    explicit = MappingRule(9028, 8000, tls=True)
+    assert explicit.to_dict()["tls"] is True
+    assert MappingRule.from_dict(explicit.to_dict()).tls is True
+
+    off = MappingRule(9028, 8000, tls=False)
+    assert off.to_dict()["tls"] is False
+    assert MappingRule.from_dict(off.to_dict()).tls is False
+
+
+def test_server_config_roundtrip_keeps_visitor_tls() -> None:
+    cfg = ServerConfig.from_file(ROOT / "config.json")
+    cfg.tls = ServerTlsConfig(visitor_enabled=True, visitor_cert="vc.pem", visitor_key="vk.pem")
+
+    restored = ServerConfig.from_dict(cfg.to_dict())
+
+    assert restored.tls.visitor_enabled is True
+    assert restored.tls.visitor_cert == "vc.pem"
+    assert restored.tls.visitor_key == "vk.pem"

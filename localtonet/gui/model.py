@@ -41,6 +41,7 @@ __all__ = [
     "adopt_snapshot",
     "append_log",
     "apply_event",
+    "describe_tls",
     "note_mapping_result",
 ]
 MAX_LOG_ENTRIES = 500
@@ -49,6 +50,18 @@ MAX_LOG_ENTRIES = 500
 
 DEFAULT_PUBLIC_PORT_BASE = 9000
 """新增映射时公网端口的自动取值起点。"""
+
+_TLS_LABELS: Dict[Any, str] = {None: "跟随", True: "开", False: "关"}
+"""访客端口 TLS 的三态显示文本。键刻意是 ``None``/``True``/``False`` 三个对象。"""
+
+
+def describe_tls(value: Optional[bool]) -> str:
+    """把三态 ``tls`` 转成界面文案。
+
+    ``MappingRule.tls`` 的 ``None`` 不是"没设置"，而是**有语义的一态**（跟随服务端默认），
+    所以界面上必须显示成"跟随"而不是留空——留空会让人以为字段没生效。
+    """
+    return _TLS_LABELS[value]
 
 
 # --------------------------------------------------------------------------- #
@@ -62,6 +75,10 @@ class MappingRow:
 
     做成不可变对象：编辑一律产生新实例，再由模型层统一校验后整体替换。
     这样"改了半个字段、校验失败、模型停在半新半旧"的状态根本不存在。
+
+    ``tls`` 是**三态**（``None`` 跟随 / ``True`` 开 / ``False`` 关）。
+    它必须跟着行一起透传：漏掉的话，用户在界面上改一次映射就会把该端口的
+    per-port TLS 静默打回默认——那种缺陷在界面上完全看不出来，极难排查。
     """
 
     public_port: int
@@ -69,8 +86,16 @@ class MappingRow:
     host: str = "0.0.0.0"
     local_host: str = "127.0.0.1"
     remark: str = ""
+    tls: Optional[bool] = None
 
-    FIELDS: ClassVar[Tuple[str, ...]] = ("public_port", "local_port", "host", "local_host", "remark")
+    FIELDS: ClassVar[Tuple[str, ...]] = (
+        "public_port",
+        "local_port",
+        "host",
+        "local_host",
+        "remark",
+        "tls",
+    )
     """表格列顺序，界面直接用它建表头。标成 ``ClassVar``，否则会被当成数据字段
     混进 ``repr``、``__init__`` 与 ``replace``——那会让"比较两行是否相同"凭空多出一列。"""
 
@@ -82,11 +107,13 @@ class MappingRow:
             host=rule.host,
             local_host=rule.local_host,
             remark=rule.remark,
+            tls=rule.tls,
         )
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any], where: str = "mapping[]") -> "MappingRow":
-        """从原始 dict 构造。校验直接复用配置层的 ``MappingRule.from_dict``。"""
+        """从原始 dict 构造。校验直接复用配置层的 ``MappingRule.from_dict``，
+        所以"旧 payload 缺 ``tls`` 键"这件事在这里自动得到容忍（解析成 ``None``）。"""
         return cls.from_rule(MappingRule.from_dict(data, where))
 
     def to_rule(self) -> MappingRule:
@@ -96,6 +123,7 @@ class MappingRow:
             host=self.host,
             local_host=self.local_host,
             remark=self.remark,
+            tls=self.tls,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -105,19 +133,25 @@ class MappingRow:
         """返回替换了若干字段的新行（**不做校验**，校验在模型层统一做）。"""
         return replace(self, **changes)
 
-    def signature(self) -> Tuple[int, int, str, str, str]:
+    def signature(self) -> Tuple[int, int, str, str, str, Optional[bool]]:
         """用于比较"用户改没改"。
 
         必须**逐字段**取全，不能只比端口：只改备注也算改过，
         否则用户改了备注却点不动"提交"，会以为界面坏了。
+        三态 ``tls`` 同理——切了开关却不显示"已修改"会让人以为没生效。
         """
-        return (self.public_port, self.local_port, self.host, self.local_host, self.remark)
+        return (self.public_port, self.local_port, self.host, self.local_host, self.remark, self.tls)
 
     def describe(self) -> str:
         return f"{self.public_port} -> {self.local_port}"
 
     def as_cells(self) -> Tuple[str, ...]:
-        """表格一行的显示文本（端口等都转字符串，布尔值不会混进来）。"""
+        """表格一行里**配置数据**部分的显示文本（端口等都转字符串）。
+
+        刻意不包含"访客 TLS"与"状态"这两列：它们由界面层在渲染时追加
+        （见 ``app._render_table``），这样本方法保持"与 MappingRule 字段同构"，
+        界面列怎么排都不用改这里。
+        """
         return (
             str(self.public_port),
             str(self.local_port),
@@ -231,10 +265,12 @@ class MappingTableModel:
         host: str = "0.0.0.0",
         local_host: Optional[str] = None,
         remark: str = "",
+        tls: Optional[bool] = None,
     ) -> int:
         """新增一行，返回插入位置（追加在末尾）。
 
         公网端口留空时自动挑一个没被占用的值，这样连点两次"新增"不会立刻撞重复规则。
+        ``tls`` 默认 ``None``（跟随服务端默认），不改变既有行为。
         """
         candidate = MappingRow(
             public_port=public_port
@@ -244,6 +280,7 @@ class MappingTableModel:
             host=host,
             local_host=local_host if local_host is not None else self._default_local_host,
             remark=remark,
+            tls=tls,
         )
         self._commit(self._rows + [candidate])
         return len(self._rows) - 1

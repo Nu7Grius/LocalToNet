@@ -39,8 +39,10 @@ __all__ = [
     "MIN_TLS_VERSION",
     "build_client_context",
     "build_server_context",
+    "build_visitor_context",
     "describe_client_tls",
     "describe_server_tls",
+    "describe_visitor_tls",
 ]
 
 MIN_TLS_VERSION = ssl.TLSVersion.TLSv1_2
@@ -155,6 +157,46 @@ def build_client_context(
     return context
 
 
+def build_visitor_context(
+    cfg: ServerTlsConfig,
+    *,
+    logger: Optional[logging.Logger] = None,
+) -> Optional[ssl.SSLContext]:
+    """构建**访客端口**的 TLS 上下文；没有配证书时返回 ``None``。
+
+    与 :func:`build_server_context` 的三点关键差异（都是刻意的，别"统一"掉）：
+
+    1. **判据是"证书是否齐备"，不是 ``visitor_enabled``**。
+       把"能不能用"（证书）与"要不要用"（端口开关）拆开，才支持
+       "全局默认关、个别端口 ``tls: true`` 显式开"——若拿全局开关当判据，
+       全局一关就会把显式打开的端口一起废掉，且表现为静默降级成明文。
+    2. **只做单向认证**：不设 ``verify_mode``，也不接受访客证书。
+       访客是公网上的陌生人，要求他出示证书等于把服务挂掉；
+       ``require_client_cert`` / ``client_ca`` 是隧道两端之间的事，跟这里无关。
+    3. **不设 ``alpn_protocols``**：一旦协商出 ``h2``，而"客户端 → 内网后端"那一跳
+       仍是 HTTP/1.1，隧道并不透传 ALPN，就会出现"浏览器以为在说 h2、
+       后端在说 h1"的诡异故障。留空让浏览器退回 HTTP/1.1。
+    """
+    if not (cfg.visitor_cert and cfg.visitor_key):
+        return None
+    log = logger or get_logger("core.tls")
+    certfile = _require_file(cfg.visitor_cert, "tls.visitor_cert")
+    keyfile = _require_file(cfg.visitor_key, "tls.visitor_key")
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = MIN_TLS_VERSION
+    # 同 build_server_context：服务端不校验"服务端证书的主机名"，显式写出来让它可见
+    context.check_hostname = False
+    _load_cert_chain(context, certfile, keyfile, "访客端口证书")
+
+    log.info(
+        "访客端口 TLS 上下文已就绪：最低 %s，证书 %s（单向认证，不支持 ALPN 协商）",
+        MIN_TLS_VERSION.name,
+        certfile,
+    )
+    return context
+
+
 def describe_server_tls(cfg: ServerTlsConfig) -> str:
     """给启动日志用的一句话描述。"""
     if not cfg.enabled:
@@ -169,3 +211,17 @@ def describe_client_tls(cfg: ClientTlsConfig) -> str:
     if cfg.skip_verify:
         return "TLS（已跳过校验，仅调试）"
     return f"TLS（校验主机名：{'开' if cfg.check_hostname else '关'}）"
+
+
+def describe_visitor_tls(cfg: ServerTlsConfig) -> str:
+    """访客端口 TLS 的一句话描述，给启动日志用。
+
+    只描述"全局默认 + 能不能用"，因为 per-port 覆盖要逐端口才看得到——
+    那件事由 ``MappingManager._listen`` 的逐端口日志负责。
+    """
+    if not (cfg.visitor_cert and cfg.visitor_key):
+        return "访客端口：全部明文（未配置 tls.visitor_cert/visitor_key）"
+    return (
+        f"访客端口：默认{'TLS' if cfg.visitor_enabled else '明文'}"
+        f"（证书 {cfg.visitor_cert}，可用 mapping[].tls 逐端口覆盖）"
+    )

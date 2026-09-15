@@ -39,6 +39,9 @@ _ENV_KEYS = (
     "LOCALTONET_TLS_CLIENT_CA",
     "LOCALTONET_TLS_REQUIRE_CLIENT_CERT",
     "LOCALTONET_TLS_ENABLED",
+    "LOCALTONET_TLS_VISITOR_ENABLED",
+    "LOCALTONET_TLS_VISITOR_CERT",
+    "LOCALTONET_TLS_VISITOR_KEY",
     "LOCALTONET_LOG_LEVEL",
 )
 
@@ -268,3 +271,65 @@ def test_cli_without_tls_keeps_json_tls(tmp_path: Path) -> None:
     config = load_config(parse(["-c", str(path)]))
 
     assert config.tls.enabled is True
+
+
+# --------------------------------------------------------------------------- #
+# 访客端口 TLS
+# --------------------------------------------------------------------------- #
+
+
+def _write_visitor_tls_config(tmp_path: Path) -> Path:
+    payload: Dict[str, Any] = {
+        "name": "cli-test",
+        "control": {"host": "127.0.0.1", "port": 7000},
+        "data": {"host": "127.0.0.1", "port": 7001},
+        "mapping": [{"public_port": 9028, "local_port": 8000}],
+        "tls": {"visitor_enabled": True, "visitor_cert": "json-vc.pem", "visitor_key": "json-vk.pem"},
+    }
+    path = tmp_path / "visitor.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def test_cli_visitor_cert_and_key_imply_global_default_on(tmp_path: Path) -> None:
+    """给出访客证书即隐式打开**全局默认**，但绝不碰控制/数据两跳的 ``tls.enabled``。"""
+    path = write_server_config(tmp_path)
+    config = load_config(
+        parse(["-c", str(path), "--visitor-tls-cert", "vc.pem", "--visitor-tls-key", "vk.pem"])
+    )
+
+    assert config.tls.visitor_enabled is True
+    assert config.tls.visitor_cert == "vc.pem"
+    assert config.tls.visitor_key == "vk.pem"
+    assert config.tls.enabled is False, "访客端口 TLS 与控制/数据两跳是两个独立开关"
+
+
+def test_cli_no_visitor_tls_overrides_json(tmp_path: Path) -> None:
+    """``--no-visitor-tls`` 是逃生门：JSON 里开着也能一键全关。"""
+    path = _write_visitor_tls_config(tmp_path)
+    config = load_config(parse(["-c", str(path), "--no-visitor-tls"]))
+
+    assert config.tls.visitor_enabled is False
+
+
+def test_cli_visitor_tls_cert_and_no_visitor_tls_are_mutually_exclusive(tmp_path: Path) -> None:
+    path = write_server_config(tmp_path)
+    with pytest.raises(SystemExit) as excinfo:
+        parse(["-c", str(path), "--visitor-tls-cert", "vc.pem", "--no-visitor-tls"])
+
+    assert excinfo.value.code == 2
+
+
+def test_cli_without_visitor_flags_keeps_json_visitor_tls(tmp_path: Path) -> None:
+    """不给任何访客参数时 JSON 原样保留——证明这些开关的 default 是 None（三态）。"""
+    path = _write_visitor_tls_config(tmp_path)
+    config = load_config(parse(["-c", str(path)]))
+
+    assert config.tls.visitor_enabled is True
+    assert config.tls.visitor_cert == "json-vc.pem"
+    assert config.tls.visitor_key == "json-vk.pem"
+
+    args = parse(["-c", str(path)])
+    assert args.visitor_tls_cert is None
+    assert args.visitor_tls_key is None
+    assert args.no_visitor_tls is False

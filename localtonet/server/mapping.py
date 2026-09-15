@@ -28,10 +28,11 @@ import contextlib
 import json
 import logging
 import os
+import ssl
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable, Dict, List, Optional, Sequence
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
 from config import ConfigError, MappingRule, MappingStoreConfig
 from localtonet.core.events import EventBus, EventType
@@ -255,7 +256,19 @@ class MappingDiff:
 
 
 class MappingManager:
-    """访客端口监听的起停与动态更新。"""
+    """访客端口监听的起停与动态更新。
+
+    **访客端口 TLS**（本轮扩展）由四个构造参数决定，它们的分工是刻意的：
+
+    * ``visitor_tls`` —— 已建好的 ``SSLContext``，**没有**则为 ``None``（＝用不了）。
+      判据是"能不能用"（证书齐备），不是"要不要用"。
+    * ``visitor_default`` —— 未显式表态的端口跟不跟着开（``tls.visitor_enabled``）。
+    * ``visitor_forced_plain`` —— CLI ``--no-visitor-tls`` 逃生门，一票否决全部端口。
+    * ``visitor_handshake_timeout`` —— 复用 ``tls.handshake_timeout``。
+
+    上下文在这里**只被引用、不被构建**：它必须是"建一次全程复用"的那一份，
+    热切换开关时也不重建（见 ``_listen``）。
+    """
 
     def __init__(
         self,
@@ -266,6 +279,10 @@ class MappingManager:
         backlog: int = 128,
         logger: Optional[logging.Logger] = None,
         events: Optional[EventBus] = None,
+        visitor_tls: Optional[ssl.SSLContext] = None,
+        visitor_default: bool = False,
+        visitor_forced_plain: bool = False,
+        visitor_handshake_timeout: float = 10.0,
     ) -> None:
         self._store = store
         self._on_visitor = on_visitor
@@ -275,6 +292,41 @@ class MappingManager:
         self._events = events or EventBus(self._log)
         self._servers: Dict[int, asyncio.AbstractServer] = {}
         self._tasks: set[asyncio.Task] = set()
+        self._visitor_tls = visitor_tls
+        self._visitor_default = visitor_default
+        self._visitor_forced_plain = visitor_forced_plain
+        self._visitor_handshake_timeout = visitor_handshake_timeout
+
+    # ------------------------------------------------------------------ #
+    # 访客端口 TLS 判定
+    # ------------------------------------------------------------------ #
+
+    def effective_tls(self, rule: MappingRule) -> bool:
+        """某条规则**实际**是否做 TLS 终止。
+
+        三态语义：``rule.tls`` 为 ``None`` 时跟随 ``visitor_default``，
+        否则以端口自己的表态为准。逃生门在最外层，一票否决。
+        """
+        if self._visitor_forced_plain:
+            return False
+        return self._visitor_default if rule.tls is None else rule.tls
+
+    def _require_certs(self, rules: Sequence[MappingRule]) -> None:
+        """确认"要开 TLS 的端口"都有证书，否则报错。
+
+        **必须在停监听/替换 store 之前调用**：``apply()`` 的 ``except`` 只捕 ``OSError``，
+        若让 ``ConfigError`` 从 ``_listen`` 里穿透出去，就会留下
+        "旧监听已停、store 已替换、新监听没起"的不一致状态。
+        ``start()`` 同理会留下半启动的映射表。
+        """
+        if self._visitor_forced_plain:
+            return
+        needing = [rule.public_port for rule in rules if self.effective_tls(rule)]
+        if needing and self._visitor_tls is None:
+            raise ConfigError(
+                f"端口 {needing} 启用了访客 TLS，但未配置 tls.visitor_cert/visitor_key"
+                "（访客端口证书必须独立提供，不会回落到 tls.cert）"
+            )
 
     # ------------------------------------------------------------------ #
     # 查询
@@ -329,6 +381,10 @@ class MappingManager:
                 len(seed),
             )
 
+        # 访客 TLS 可用性必须先校验：此时一个监听都还没起、store 还没动，
+        # 抛错出去不会留下任何"一半新一半旧"的状态
+        self._require_certs(effective)
+
         self._store.replace(effective)
         diff = MappingDiff(
             added=[rule.public_port for rule in effective],
@@ -363,6 +419,15 @@ class MappingManager:
         )
         unchanged = sorted(set(current) & set(target) - set(changed))
         diff = MappingDiff(added=added, removed=removed, changed=changed, unchanged=unchanged)
+
+        # 同样必须在停监听之前：apply() 的 except 只捕 OSError，ConfigError 穿透出去
+        # 会留下"旧监听已停、store 已替换、新监听没起"的三不管状态。
+        self._require_certs(list(target.values()))
+
+        # TLS 被关掉的端口单独告警："明文"是安全边界的变化，不能只体现在 diff 里
+        for port in changed:
+            if self.effective_tls(current[port]) and not self.effective_tls(target[port]):
+                self._log.warning("访客端口 %d 的 TLS 已关闭，该端口从此明文传输", port)
 
         # 只有 local_port / local_host / remark 变了：监听端口不用动，换掉规则即可
         if not (added or removed or changed):
@@ -421,13 +486,29 @@ class MappingManager:
 
     async def _listen(self, rule: MappingRule) -> None:
         host = rule.host or self._host
+        # ssl_handshake_timeout 只在挂了 ssl 时才允许传，所以参数得动态拼
+        # （同 server/core.py 的控制/数据通道）。访客 TLS 与明文端口可以任意混排。
+        kwargs: Dict[str, Any] = {"backlog": self._backlog}
+        use_tls = self.effective_tls(rule)
+        if use_tls:
+            kwargs["ssl"] = self._visitor_tls
+            kwargs["ssl_handshake_timeout"] = self._visitor_handshake_timeout
         server = await asyncio.start_server(
             self._make_callback(rule.public_port),
             host,
             rule.public_port,
-            backlog=self._backlog,
+            **kwargs,
         )
         self._servers[rule.public_port] = server
+        # 逐端口打一行状态：这是"改了开关却没生效"唯一的可见证据。
+        # 刻意不做运行时协议探测——_handle_visitor 配对前一个字节都不读（纯透传），
+        # 要探测就得改 pipe_both 加 peek + 前缀回放，等于侵入字节透传路径。
+        self._log.info(
+            "访客端口 %d 监听于 %s：%s",
+            rule.public_port,
+            host,
+            "TLS" if use_tls else "明文",
+        )
 
     def _make_callback(self, public_port: int):
         """生成访客连接回调。
@@ -447,10 +528,14 @@ class MappingManager:
 
         return _callback
 
-    @staticmethod
-    def _listener_changed(old: MappingRule, new: MappingRule) -> bool:
-        """是否需要重建监听：只有**绑定地址**变了才需要。"""
-        return (old.host or "") != (new.host or "")
+    def _listener_changed(self, old: MappingRule, new: MappingRule) -> bool:
+        """是否需要重建监听：**绑定地址**或**访客 TLS 开关**变了才算。
+
+        必须是实例方法：判定 effective TLS 要读 ``visitor_default`` /
+        ``visitor_forced_plain``。漏掉 TLS 这一项就是"改了开关不生效"的静默缺陷——
+        用户以为切换成功，实际监听还是老样子。
+        """
+        return (old.host or "") != (new.host or "") or self.effective_tls(old) != self.effective_tls(new)
 
     async def _restore(self, current: Dict[int, MappingRule], ports: Sequence[int]) -> List[int]:
         restored: List[int] = []

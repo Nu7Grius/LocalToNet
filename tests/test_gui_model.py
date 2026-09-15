@@ -16,7 +16,7 @@ import sys
 
 import pytest
 
-from config import ConfigError
+from config import ConfigError, MappingRule
 from localtonet.core.events import EventType
 from localtonet.core.rules import parse_mapping
 from localtonet.gui.model import (
@@ -26,6 +26,7 @@ from localtonet.gui.model import (
     MappingTableModel,
     append_log,
     apply_event,
+    describe_tls,
     note_mapping_result,
 )
 from localtonet.gui.viewmodel import REMOTE_STALE_NOTICE, GuiViewModel
@@ -66,6 +67,42 @@ def test_row_signature_covers_every_field() -> None:
     row = MappingRow(9028, 8000)
     assert row.signature() != row.with_changes(remark="备注").signature()
     assert row.signature() != row.with_changes(host="127.0.0.1").signature()
+
+
+# --------------------------------------------------------------------------- #
+# MappingRow：访客 TLS 三态
+# --------------------------------------------------------------------------- #
+
+
+def test_row_carries_three_state_tls_through_every_conversion() -> None:
+    """三态 ``tls`` 必须跟着行透传。
+
+    漏掉它的话，用户在界面上改一次映射就会把该端口的 per-port TLS **静默打回默认**——
+    界面上完全看不出来，只能靠这条用例守着。
+    """
+    for value in (None, True, False):
+        row = MappingRow.from_rule(MappingRule(9028, 8000, tls=value))
+        assert row.tls is value
+        assert row.to_rule().tls is value
+
+    # 切了开关必须被算成"改过"，否则"提交"按钮不会亮，用户以为界面坏了
+    assert MappingRow(9028, 8000).signature() != MappingRow(9028, 8000, tls=True).signature()
+    # 显示文案：None 是独立语义（跟随），不能显示成空白
+    assert describe_tls(None) == "跟随"
+    assert describe_tls(True) == "开"
+    assert describe_tls(False) == "关"
+
+
+def test_row_accepts_legacy_payload_without_tls_key() -> None:
+    """服务端下发的旧 payload 缺 ``tls`` 键 → 解析成 ``None``（跟随），回写也不带该键。"""
+    legacy = MappingRow.from_dict({"public_port": 9028, "local_port": 8000})
+
+    assert legacy.tls is None
+    assert "tls" not in legacy.to_dict()
+
+    explicit = MappingRow.from_dict({"public_port": 9028, "local_port": 8000, "tls": True})
+    assert explicit.tls is True
+    assert explicit.to_dict()["tls"] is True
 
 
 # --------------------------------------------------------------------------- #

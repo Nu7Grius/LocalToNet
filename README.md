@@ -23,6 +23,8 @@
 - **映射持久化**：`--mapping-store file` 把映射表落到 JSON，重启服务端不再回到配置文件的状态
 - **传输加密（TLS）**：控制通道与数据通道可选走 TLS（默认关闭＝明文），令牌不再以明文出现在线路上；
   支持双向认证（mTLS）作为可选纵深防御
+- **访客端口 TLS 终止**：公网入口那一跳也能逐端口开 TLS（`mapping[].tls`，默认明文）；
+  证书独立、绝不回落，开关可热切
 - **零运行时依赖**：纯标准库（界面用自带的 tkinter，加密用自带的 `ssl`），Python 3.11+（开发环境用 3.13）
 
 ## 架构
@@ -128,18 +130,29 @@ python client.py --server 1.2.3.4:7000 --local-ports 8000,8080 --client-id my-pc
 | `client_id` 非法 / 端口列表非法 | `400` | 继续退避重试（改配置就能好） |
 
 > ⚠️ 令牌目前是**明文**放在 `register_client` 帧里走 TCP，`client.json` 里也是明文落盘。
-> 公网部署请置于 TLS 终止层（Nginx / Caddy）之后，或按「扩展点」表接入传输加密。
+> 公网部署请至少开启「传输加密（TLS）」（控制+数据两跳），需要访客侧也加密时再按
+> 「访客端口 TLS」逐端口打开；置于 Nginx / Caddy 之后同样可行。
 
 ## 传输加密（TLS）
 
 控制通道与数据通道可以走 TLS，令牌就不会再以明文出现在公网线路上。**默认完全关闭**——
 不配任何 TLS 字段时行为与之前一字不差（明文），本地 demo 不受影响。
 
-**只加密两跳**：客户端 ↔ 服务端的控制通道与数据通道。客户端 → 内网后端那一跳走本机/内网，
-**永远明文**（给内网那一跳套 TLS 是自我感动，还会堵死"后端是明文 HTTP"这个绝大多数场景）。
-访客端口（9028 等）的 TLS 终止**本轮不做**：若你的后端本来就是 HTTPS，它已经能原样穿透隧道跑
-（服务端纯字节搬运、不做 TLS 终止），这是零配置就有的能力；若你要"访客侧加密 + 后端明文"，
-更合适的是在隧道前面放 Nginx/Caddy 做 TLS 终止。
+三跳里有两跳可以加密，而它们是**各自独立的开关**，任意组合：
+
+```
+访客 --① 可选 TLS--> 服务端 --② 可选 TLS--> 客户端 --③ 永远明文--> 内网后端
+```
+
+- **① 访客端口 ↔ 服务端**（本轮新增）：TLS 终止在服务端，**逐端口**可选，默认明文。
+  见下节「访客端口 TLS（per-port 开关）」。
+- **② 控制通道 + 数据通道**（上一轮落地）：令牌不再以明文出现在这段线路上。**默认关闭**——
+  不配任何 TLS 字段时行为与之前一字不差（明文），本地 demo 不受影响。
+- **③ 客户端 → 内网后端**：走本机/内网，**永远明文**（给内网那一跳套 TLS 是自我感动，
+  还会堵死"后端是明文 HTTP"这个绝大多数场景）。
+
+> 三跳之外还有一件 TLS 管不了的事：`client.json` 里的 `auth_token` 明文落盘、`--token` 进进程列表。
+> 生产环境优先用环境变量或受限权限的配置文件。
 
 ### 快速开始
 
@@ -173,6 +186,8 @@ python client.py --server 127.0.0.1 --local-ports 8000 --tls-ca tests/certs/ca.p
 | `require_client_cert` | 是否要求客户端证书（mTLS） | `false` |
 | `client_ca` | 校验客户端证书用的 CA，仅 mTLS 时用 | 空 |
 | `handshake_timeout` | TLS 握手超时（默认 60s 会让"明文打 TLS 端口"白占连接一分钟） | `10.0` |
+| `visitor_enabled` | **访客端口** TLS 的**默认值**（未显式表态的端口跟不跟着它，不是总开关） | `false` |
+| `visitor_cert` / `visitor_key` | 访客端口证书链 / 私钥（PEM，须成对）。**独立于 `cert`/`key`，绝不回落** | 空 |
 
 **客户端 `tls`**：
 
@@ -188,6 +203,60 @@ python client.py --server 127.0.0.1 --local-ports 8000 --tls-ca tests/certs/ca.p
 客户端 `--tls-ca/--tls-cert/--tls-key/--tls-skip-verify/--no-tls`。`gui.py` 与 `client.py` 参数一致，
 自动继承。`--no-tls` 是本地演示逃生门（命令行优先级最高，能覆盖配置/环境变量里开着的 TLS）。
 环境变量对应 `LOCALTONET_TLS_*`（如 `LOCALTONET_TLS_CERT`、`LOCALTONET_TLS_CA`）。
+
+### 访客端口 TLS（per-port 开关，默认明文）
+
+让"访客 ↔ 服务端"这一跳也走 TLS。**默认完全关闭**，且**逐端口**表态：
+
+| 位置 | 取值 | 说明 |
+| --- | --- | --- |
+| `mapping[].tls` | `null`（缺省）/ `true` / `false` | `null` = 跟随 `tls.visitor_enabled`（默认 `false`＝明文） |
+| `tls.visitor_enabled` | `true` / `false` | 只决定"未表态的端口"的默认值，**不是总开关** |
+
+```jsonc
+// 服务端 config.json：一份访客证书服务所有访客 TLS 端口（per-port 只控开关，不控证书）
+{
+  "tls": {
+    "visitor_cert": "visitor-fullchain.pem",
+    "visitor_key": "visitor.key",
+    "visitor_enabled": false        // 默认明文，下面逐端口开
+  },
+  "mapping": [
+    { "public_port": 9028, "local_port": 8000, "tls": true  },   // 这个端口 TLS 终止
+    { "public_port": 9029, "local_port": 8001, "tls": false }    // 这个端口明文
+  ]
+}
+```
+
+```bash
+# 命令行：给出证书即隐式把**全局默认**打开（所有未表态的端口都变 TLS）
+python server.py --visitor-tls-cert visitor-fullchain.pem --visitor-tls-key visitor.key
+# 逃生门：一键全关，连 mapping[].tls=true 也压过去（本地演示用）
+python server.py --no-visitor-tls
+```
+
+> ⚠️ 只想给**个别**端口开 TLS 时，把证书写进 `config.json` 的 `tls` 块并保持 `visitor_enabled: false`，
+> 用 `mapping[].tls` 逐端口表态。命令行给证书是"隐式打开全局默认"，会把没表态的端口一起变成 TLS。
+> per-port 开关**只有 JSON 一条路**（同 `limits` 与 `mapping`），CLI 不做。
+
+**三条刻意的设计决定**：
+
+1. **证书独立、绝不回落**。缺 `visitor_cert`/`visitor_key` 时**报错**，不会退回 `tls.cert`——
+   隧道自签证书和公网入口证书信任域不同，回落是隐式行为，误用代价大（以为配了公网证书、
+   实则自签，浏览器报红查不出原因）。per-port 开了 TLS 却没证书 → **启动失败**，不静默降级成明文。
+2. **只做单向认证**，不支持 mTLS。访客是公网上的陌生人，要求他出示证书等于把服务挂掉。
+3. **不协商 ALPN**。一旦协商出 `h2` 而"客户端 → 后端"那跳仍是 HTTP/1.1，隧道并不透传 ALPN，
+   会出现"浏览器以为在说 h2、后端在说 h1"的诡异故障；留空让浏览器退回 HTTP/1.1。
+
+**开关可热切，证书路径只重启生效**：改 `mapping[].tls` 提交后监听会重建（`mapping_result.diff`
+记在 `changed` 里），换证书文件则需要重启服务端；关掉 TLS 时会额外打一条 WARNING。
+每个访客端口启动时都会打一行 `访客端口 N 监听于 host：TLS/明文`——这是"改了开关却没生效"
+唯一的可见证据（**不做运行时协议探测**：服务端在配对前不读访客一个字节，要探测就得侵入字节透传路径）。
+
+> **边界**：这个开关解决的是"访客 ↔ 服务端这一跳加密"。如果你的内网后端**本身就是 HTTPS**，
+> 它已经能原样穿透隧道（服务端纯字节搬运），此时**不要**打开这个开关——那会变成
+> "TLS 里再套一层 TLS"，白付一次握手和加密开销。想换证书品牌、加 WAF 或统一入口，
+> 更合适的是在隧道前面放 Nginx/Caddy。
 
 ### 认证方向与失败语义
 
@@ -338,7 +407,7 @@ LocalToNet/
 │       ├── viewmodel.py      邮筒消息 → 表格与状态栏（纯逻辑）
 │       └── app.py            窗口、表格、按钮、状态栏、日志面板
 ├── examples/demo_backend.py  演示用内网 HTTP 服务
-└── tests/                    255 项测试（单测 + 端到端 + GUI + 命令行 + TLS）
+└── tests/                    281 项测试（单测 + 端到端 + GUI + 命令行 + TLS + 访客端 TLS）
 ```
 
 ## 协议
@@ -435,7 +504,7 @@ python gui.py --no-autostart                   # 先把映射表配好再连
 | 操作 | 说明 |
 | --- | --- |
 | 连接 / 断开 | 拉起或停止客户端主循环，心跳与重连策略完全复用命令行客户端那一套 |
-| 新增 / 复制 / 删除 / 双击编辑 | 直接改映射表；非法输入当场拦下并说明原因 |
+| 新增 / 复制 / 删除 / 双击编辑 | 直接改映射表；非法输入当场拦下并说明原因。表格里的「访客 TLS」列是三态：跟随 / 开 / 关，编辑对话框用下拉选择 |
 | 提交 | 走既有的 `set_mapping` 指令，服务端**立即起停对应端口**，不必重启进程 |
 | 放弃修改 | 回到服务端最近一次下发的版本 |
 | 状态栏 | 连接状态、认领端口、端口冲突、活跃转发、请求数与上下行字节 |
@@ -485,7 +554,7 @@ Linux 上若缺 tkinter，安装系统包 `python3-tk` 即可（Windows/macOS �
 | 映射校验规则 | `core.rules.parse_mapping` | 服务端与 GUI 共用一份 | 增删规则只改这一处 |
 | 界面与观测 | `core.events.EventBus` | tkinter GUI + 结构化日志 | Web 界面 / Prometheus |
 | 限流配额 | `core.pipe.RateLimitHook` | `ClientRateLimiter`（令牌桶，按客户端 × 方向） | 加权公平队列 / 按端口限速 |
-| 传输加密 | 建立连接处 | 明文 / TLS（`core.tls` 建上下文） | 访客端口 TLS 终止 / 会话密钥 |
+| 传输加密 | 建立连接处 | 明文 / TLS（`core.tls` 建上下文），控制+数据+访客三跳各自可选 | 会话密钥 / 换 TLS 库 |
 | 超时参数 | `config.Timeouts` | 集中默认值 | 环境变量 / 运行时可调 |
 
 事件总线已预留 `REQUEST_START` / `REQUEST_END` / `CONN_ERROR` / `MAPPING_CHANGED` 等事件，
@@ -499,9 +568,9 @@ python -m pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-当前 **255 项全部通过**（test_protocol 17 / test_config 48 / test_core 40 / test_e2e 21 /
-test_server_cli 17 / test_client_cli 5 / test_limiter 12 / test_mapping_store 21 /
-test_tls 10 / test_gui_model 47 / test_gui_bridge 10 / test_gui_controller 6），
+当前 **281 项全部通过**（test_protocol 17 / test_config 56 / test_core 40 / test_e2e 21 /
+test_server_cli 21 / test_client_cli 5 / test_limiter 12 / test_mapping_store 21 /
+test_tls 10 / test_visitor_tls 13 / test_gui_model 49 / test_gui_bridge 10 / test_gui_controller 6），
 其中 21 项是真实拉起三件套、走真实 TCP 的端到端测试：
 
 | 用例 | 验证内容 |
@@ -537,6 +606,15 @@ test_tls 10 / test_gui_model 47 / test_gui_bridge 10 / test_gui_controller 6）�
 三种都测，`skip_verify` 必须显式开启才生效）；**TLS 握手失败 = 永久失败**（客户端停手、退出码 1，
 不无限退避重试）。测试证书是 `tests/certs/` 里入库的一次性材料（有效期 30 年，见其 README），
 `pytest` 路径上不调用 openssl——保持"零运行时依赖"也适用于测试。
+
+`tests/test_visitor_tls.py`（13 项）覆盖**访客端口** TLS 终止，守六条线：**正向**（per-port 开 TLS
+后往返正常、TLS 端口与明文端口并存于同一张映射表、512KB 不丢字节）；**证伪**（明文访客打 TLS 端口、
+TLS 访客打明文端口都必须拿不到数据，否则"配置里多了几个字段但连接还走明文"会蒙混过关）；
+**默认行为一字不变**（不配任何 visitor 字段就是全明文；手写缺 `tls` 键的老 `mappings.json` 照旧加载）；
+**回滚安全**（`MappingRule(tls=None).to_dict()` 不含 `tls` 键，而 `tls=False` 必须落盘）；
+**不静默降级**（缺证书一律报错，per-port 开了 TLS 却没证书 → 启动失败且一个监听都不留）；
+**热切换**（切 `tls` 时 `diff.changed` 有它、监听重建、握手协议真的换了；缺证书的更新必须在
+停监听**之前**被拒，端口仍能正常服务）。
 
 `tests/test_limiter.py` 用假时钟（记录每次 sleep 的时长）断言令牌桶**真的在等**而不是空转：
 初始桶是满的、请求大于桶容量时被拆分且总量守恒、`rate <= 0` 被拒、禁用时不创建任何桶。
@@ -581,5 +659,12 @@ GUI 相关的三项测试（`test_gui_model` / `test_gui_bridge` / `test_gui_con
 - 鉴权只有**共享令牌**，没有按客户端区分身份：持有令牌的客户端可以认领任意访客端口；
   mTLS（`require_client_cert`）能在传输层加一道客户端证书身份，但分发/轮换客户端证书本身是运维负担
 - 令牌是**静态**的：轮换需要重启服务端（换成 mTLS / 签名挑战 / 一次性票据见扩展点表）
+- 访客端口 TLS **只做单向认证**：访客是公网陌生人，不支持也不打算支持 mTLS
+- 访客端口 TLS 的证书是**一份服务所有端口**：per-port 只控开关，不能逐端口配不同证书；
+  证书路径**只在重启时生效**（改证书文件需重启服务端），能热切的只有开关
+- 显式设了 per-port `tls` 的 `mappings.json` **无法回滚到 `beaaf5f`**：老版本的 `_check_unknown`
+  会因多出的 `tls` 键拒绝启动。只有"未显式设置"（不写 `tls` 键）的规则才回滚安全
+- 访客端口**不做运行时协议探测**：服务端在配对前不读访客一个字节（纯透传），
+  所以"明文请求打到了 TLS 端口"这类错配只能靠启动日志的逐端口状态提示，不会自动纠正
 
-后续计划：访客端口 TLS 终止（独立可选开关，默认关）→ 服务端侧管理界面 → 按请求的带宽统计与限流粒度细化。
+后续计划：服务端侧管理界面 → 按请求的带宽统计与限流粒度细化 → 令牌热轮换（免重启）。

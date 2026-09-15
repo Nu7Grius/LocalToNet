@@ -30,7 +30,7 @@ from typing import Any, Dict, Optional
 from config import ClientConfig, ConfigError
 from localtonet.gui.bridge import LoopThread, UiBridge
 from localtonet.gui.controller import GuiController
-from localtonet.gui.model import MappingRow
+from localtonet.gui.model import MappingRow, describe_tls
 from localtonet.gui.viewmodel import GuiViewModel
 from logging_setup import get_logger
 
@@ -48,6 +48,20 @@ _LOG_COLORS = {
 
 _DIRTY_TAG_BG = "#fff4c2"
 """有未提交改动的行用一种柔和的琥珀色标出来——比加一列"是否修改"更直观。"""
+
+_TLS_OPTIONS = (
+    ("跟随服务端默认", None),
+    ("开（TLS 终止）", True),
+    ("关（明文）", False),
+)
+"""访客端口 TLS 的下拉选项。
+
+**三态缺一不可**：``None``（跟随）是独立语义，不是"没说"。用两态复选框会让
+"跟随默认"这个状态无法表达，用户一打开编辑框就把端口的表态改掉了。
+"""
+
+_TLS_BY_LABEL = {label: value for label, value in _TLS_OPTIONS}
+_TLS_LABEL_BY_VALUE = {value: label for label, value in _TLS_OPTIONS}
 
 
 class TunnelGuiApp:
@@ -130,9 +144,10 @@ class TunnelGuiApp:
         frame = ttk.LabelFrame(self._root, text="映射表（公网端口 → 内网端口）", padding=8)
         frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
 
-        columns = ("public_port", "local_port", "host", "local_host", "remark", "state")
-        headings = ("公网端口", "内网端口", "监听地址", "内网地址", "备注", "状态")
-        widths = (100, 100, 130, 130, 260, 90)
+        # 列顺序必须与 MappingRow.as_cells() 一致（外加末尾的"状态"列）
+        columns = ("public_port", "local_port", "host", "local_host", "remark", "visitor_tls", "state")
+        headings = ("公网端口", "内网端口", "监听地址", "内网地址", "备注", "访客 TLS", "状态")
+        widths = (100, 100, 130, 130, 200, 80, 90)
 
         self._tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
         for column, heading, width in zip(columns, headings, widths):
@@ -208,7 +223,7 @@ class TunnelGuiApp:
                 "",
                 tk.END,
                 iid=str(index),
-                values=row.as_cells() + ("已修改" if is_dirty else "",),
+                values=row.as_cells() + (describe_tls(row.tls), "已修改" if is_dirty else ""),
                 tags=("dirty",) if is_dirty else (),
             )
         if selected is not None:
@@ -424,6 +439,18 @@ class TunnelGuiApp:
             entries[key] = entry
         entries["public_port"].focus_set()
 
+        # 访客 TLS 是**三态**，用只读下拉而不是复选框（见 _TLS_OPTIONS 的说明）
+        tls_row = len(fields)
+        ttk.Label(dialog, text="访客 TLS").grid(row=tls_row, column=0, sticky=tk.W, padx=10, pady=6)
+        tls_box = ttk.Combobox(
+            dialog,
+            values=[label for label, _ in _TLS_OPTIONS],
+            state="readonly",
+            width=33,
+        )
+        tls_box.set(_TLS_LABEL_BY_VALUE[initial.tls])
+        tls_box.grid(row=tls_row, column=1, sticky=tk.EW, padx=10, pady=6)
+
         result: Dict[str, Any] = {}
 
         def confirm() -> None:
@@ -434,6 +461,7 @@ class TunnelGuiApp:
                     host=entries["host"].get().strip() or "0.0.0.0",
                     local_host=entries["local_host"].get().strip() or "127.0.0.1",
                     remark=entries["remark"].get().strip(),
+                    tls=_TLS_BY_LABEL[tls_box.get()],
                 )
             except ValueError:
                 messagebox.showerror("格式错误", "端口必须是 1-65535 的整数", parent=dialog)
@@ -444,7 +472,7 @@ class TunnelGuiApp:
             dialog.destroy()
 
         buttons = ttk.Frame(dialog)
-        buttons.grid(row=len(fields), column=0, columnspan=2, pady=(4, 10))
+        buttons.grid(row=tls_row + 1, column=0, columnspan=2, pady=(4, 10))
         ttk.Button(buttons, text="确定", command=confirm, width=10).pack(side=tk.LEFT, padx=6)
         ttk.Button(buttons, text="取消", command=cancel, width=10).pack(side=tk.LEFT, padx=6)
         dialog.bind("<Return>", lambda _event: confirm())

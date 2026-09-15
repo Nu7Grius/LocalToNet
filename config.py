@@ -197,6 +197,15 @@ class MappingRule:
 
     ``host`` 是服务端监听访客端口的绑定地址；
     ``local_host`` 是客户端转发时连接内网后端的地址（仅在客户端侧有意义）。
+
+    ``tls`` 是**三态**的访客端口 TLS 开关（本轮扩展）：
+
+    * ``None``（默认）—— 跟随服务端全局默认 ``tls.visitor_enabled``，也是"旧文件缺字段"的解析结果；
+    * ``True`` —— 该端口强制 TLS 终止；
+    * ``False`` —— 该端口强制明文。
+
+    做成 ``Optional[bool]`` 而不是 ``bool`` 的理由：老 ``mappings.json`` 里没有这个键，
+    必须能解析成"没表态"而不是"关"，否则升级即改变行为。
     """
 
     public_port: int
@@ -204,25 +213,41 @@ class MappingRule:
     host: str = "0.0.0.0"
     local_host: str = "127.0.0.1"
     remark: str = ""
+    tls: Optional[bool] = None
+    """``None`` = 跟随服务端 ``tls.visitor_enabled``（默认 false＝明文）。"""
 
-    _FIELDS = ("public_port", "local_port", "host", "local_host", "remark")
+    _FIELDS = ("public_port", "local_port", "host", "local_host", "remark", "tls")
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any], where: str = "mapping[]") -> "MappingRule":
         _check_unknown(data, cls._FIELDS, where)
         if "public_port" not in data or "local_port" not in data:
             raise ConfigError(f"{where} 必须同时提供 public_port 与 local_port")
+        # 三态解析：只接受 null / true / false。JSON 里写 "tls": "true"（字符串）
+        # 是典型的"看着像开了其实没开"，必须 fail fast 而不是悄悄当 truthy 用。
+        raw_tls = data.get("tls")
+        tls = None if raw_tls is None else _as_bool(raw_tls, f"{where}.tls")
         rule = cls(
             public_port=check_port(_as_int(data["public_port"], f"{where}.public_port"), where),
             local_port=check_port(_as_int(data["local_port"], f"{where}.local_port"), where),
             host=_as_str(data.get("host", "0.0.0.0"), f"{where}.host"),
             local_host=_as_str(data.get("local_host", "127.0.0.1"), f"{where}.local_host"),
             remark=_as_str(data.get("remark", ""), f"{where}.remark"),
+            tls=tls,
         )
         return rule
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        """序列化。**必须把 ``tls is None`` 的键摘掉**。
+
+        直接 ``asdict(self)`` 会让每条规则都带 ``"tls": null``，而 ``_check_unknown``
+        只拒绝"多出来的键"——于是这些文件一旦拿回旧版本（``beaaf5f``）就会因为多出
+        ``tls`` 而**拒绝启动**。"没表态"本来就不该写进文件。
+        """
+        data = asdict(self)
+        if data.get("tls") is None:
+            data.pop("tls", None)
+        return data
 
 
 @dataclass
@@ -386,9 +411,33 @@ class ServerTlsConfig:
     """校验客户端证书用的 CA 路径，仅 ``require_client_cert=True`` 时生效。"""
     handshake_timeout: float = 10.0
     """TLS 握手超时秒数。默认 60s 会让"明文客户端打 TLS 端口"这类失败白占连接，
-    直接拖慢测试收尾，因此显式收紧。"""
+    直接拖慢测试收尾，因此显式收紧。访客端口复用同一个值，不为它单开字段。"""
 
-    _FIELDS = ("enabled", "cert", "key", "require_client_cert", "client_ca", "handshake_timeout")
+    visitor_enabled: bool = False
+    """**访客端口**（浏览器/curl 打进来的那一跳）TLS 终止的**默认值**，不是总开关。
+
+    语义是"未显式设置 ``MappingRule.tls`` 的端口跟不跟着它"：``False`` 表示默认明文，
+    单个端口仍可用 ``"tls": true`` 显式打开；``True`` 表示默认全开，单个端口可用
+    ``"tls": false`` 关回去。所以"全局关"**不会**废掉某个端口显式开的开关。
+    """
+    visitor_cert: str = ""
+    """访客端口证书链（PEM）。**独立于 ``cert``、绝不回落**——隧道自签证书够用，
+    访客端口是公网入口，证书必须被浏览器信任，两者信任域不同，
+    一旦隐式回落就会出现"以为配了公网证书、实则自签、浏览器报红查不出原因"。"""
+    visitor_key: str = ""
+    """访客端口私钥（PEM）。与 ``visitor_cert`` 成对提供。"""
+
+    _FIELDS = (
+        "enabled",
+        "cert",
+        "key",
+        "require_client_cert",
+        "client_ca",
+        "handshake_timeout",
+        "visitor_enabled",
+        "visitor_cert",
+        "visitor_key",
+    )
 
     @classmethod
     def from_dict(cls, data: Optional[Mapping[str, Any]]) -> "ServerTlsConfig":
@@ -402,11 +451,28 @@ class ServerTlsConfig:
             require_client_cert=_as_bool(data.get("require_client_cert", False), "tls.require_client_cert"),
             client_ca=_as_str(data.get("client_ca", ""), "tls.client_ca"),
             handshake_timeout=_as_float(data.get("handshake_timeout", 10.0), "tls.handshake_timeout"),
+            visitor_enabled=_as_bool(data.get("visitor_enabled", False), "tls.visitor_enabled"),
+            visitor_cert=_as_str(data.get("visitor_cert", ""), "tls.visitor_cert"),
+            visitor_key=_as_str(data.get("visitor_key", ""), "tls.visitor_key"),
         )
 
     def validate(self) -> None:
         if self.handshake_timeout <= 0:
             raise ConfigError("tls.handshake_timeout 必须为正数")
+
+        # 访客端口 TLS 与 ``enabled``（控制/数据两跳）是各自独立的开关，
+        # 因此这几条校验必须放在 ``enabled`` 的早退**之前**——否则
+        # "控制通道明文 + 访客端口 TLS"这个完全合法的组合会被整体跳过校验。
+        if bool(self.visitor_cert) != bool(self.visitor_key):
+            raise ConfigError("tls.visitor_cert 与 tls.visitor_key 必须成对提供（访客端口 TLS 用）")
+        if self.visitor_enabled and not (self.visitor_cert and self.visitor_key):
+            raise ConfigError(
+                "tls.visitor_enabled 为 true 时必须同时提供 tls.visitor_cert 与 tls.visitor_key，"
+                "否则默认开的端口会静默变成明文"
+            )
+        # 注意：visitor_enabled=False 但给了证书 —— **不报错**。
+        # 那正是"默认关、个别端口显式开"的用法（见 MappingRule.tls 三态）。
+
         if not self.enabled:
             return
         if not self.cert or not self.key:
@@ -604,6 +670,18 @@ class ServerConfig:
         if "tls_handshake_timeout" in env:
             cfg.tls.handshake_timeout = _as_float(
                 env["tls_handshake_timeout"], "LOCALTONET_TLS_HANDSHAKE_TIMEOUT"
+            )
+        # 访客端口 TLS：同样"给出证书路径即隐式开启"，但它们只影响全局默认
+        # （``visitor_enabled``），不碰控制/数据两跳的 ``tls.enabled``。
+        if "tls_visitor_cert" in env:
+            cfg.tls.visitor_cert = env["tls_visitor_cert"]
+            cfg.tls.visitor_enabled = True
+        if "tls_visitor_key" in env:
+            cfg.tls.visitor_key = env["tls_visitor_key"]
+            cfg.tls.visitor_enabled = True
+        if "tls_visitor_enabled" in env:
+            cfg.tls.visitor_enabled = _as_env_bool(
+                env["tls_visitor_enabled"], "LOCALTONET_TLS_VISITOR_ENABLED"
             )
         if "log_level" in env:
             cfg.log.level = env["log_level"].upper()
