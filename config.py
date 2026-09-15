@@ -277,16 +277,22 @@ class ListenerConfig:
 
 @dataclass
 class AuthConfig:
-    """客户端鉴权。
+    """客户端鉴权。两种凭据来源，**互斥**：
 
-    MVP 里 ``enabled=False``，服务端使用 :class:`NoneAuthenticator` 直接放行。
-    ``enabled=True`` 时走 :class:`TokenAuthenticator`，与协议中预留的 ``token`` 字段对接。
+    * ``token`` —— 单个**共享**令牌（兼容路径）。谁拿到它都能认领任意端口，
+      换令牌必须重启；适合本地演示与"整个内网就是一个信任域"的场景。
+    * ``file`` —— 令牌表文件（JSON）。每个令牌自带身份与**允许认领的内网端口**，
+      改文件最迟在下一次注册尝试时生效，不必重启。
+
+    ``file`` 给出时以**文件为权威**、``token`` 只当首次种子（与 ``mapping_store`` 同一先例）。
+    令牌表刻意**不内联进** ``config.json``：令牌是机密，而配置文件常被提交进仓库或贴进文档。
     """
 
     enabled: bool = False
     token: str = ""
+    file: str = ""
 
-    _FIELDS = ("enabled", "token")
+    _FIELDS = ("enabled", "token", "file")
 
     @classmethod
     def from_dict(cls, data: Optional[Mapping[str, Any]]) -> "AuthConfig":
@@ -296,11 +302,18 @@ class AuthConfig:
         return cls(
             enabled=_as_bool(data.get("enabled", False), "auth.enabled"),
             token=_as_str(data.get("token", ""), "auth.token"),
+            file=_as_str(data.get("file", ""), "auth.file"),
         )
 
     def validate(self) -> None:
-        if self.enabled and not self.token:
-            raise ConfigError("auth.enabled 为 true 时必须提供 auth.token")
+        # 互斥先查：同时给两者时不该让人猜"到底哪个生效"（哪怕 enabled=false 也 fail fast）
+        if self.token and self.file:
+            raise ConfigError(
+                "auth.token 与 auth.file 互斥：共享令牌与令牌表文件只能二选一，"
+                "两者同时给出时无法判断以哪个为准"
+            )
+        if self.enabled and not (self.token or self.file):
+            raise ConfigError("auth.enabled 为 true 时必须提供 auth.token 或 auth.file")
 
 
 @dataclass
@@ -647,6 +660,11 @@ class ServerConfig:
             cfg.advertise_host = env["advertise_host"]
         if "auth_token" in env:
             cfg.auth.token = env["auth_token"]
+            cfg.auth.enabled = True
+        # 令牌表文件：同样"给出即隐式开启"（与 --mapping-store-path 隐式切 file 同理）。
+        # 与 LOCALTONET_AUTH_TOKEN 同时给出会在下面的 validate() 里被互斥校验拦下。
+        if "auth_file" in env:
+            cfg.auth.file = env["auth_file"]
             cfg.auth.enabled = True
         if "mapping_store" in env:
             cfg.mapping_store.type = env["mapping_store"].strip().lower()

@@ -32,6 +32,7 @@ _ENV_KEYS = (
     "LOCALTONET_DATA_HOST",
     "LOCALTONET_ADVERTISE_HOST",
     "LOCALTONET_AUTH_TOKEN",
+    "LOCALTONET_AUTH_FILE",
     "LOCALTONET_MAPPING_STORE",
     "LOCALTONET_MAPPING_STORE_PATH",
     "LOCALTONET_TLS_CERT",
@@ -135,6 +136,107 @@ def test_token_and_no_auth_are_mutually_exclusive(tmp_path: Path) -> None:
     path = write_server_config(tmp_path)
     with pytest.raises(SystemExit) as excinfo:
         parse(["-c", str(path), "--token", "x", "--no-auth"])
+
+    assert excinfo.value.code == 2
+
+
+# --------------------------------------------------------------------------- #
+# 令牌表（--auth-file，鉴权二期）
+# --------------------------------------------------------------------------- #
+
+
+def test_cli_auth_file_turns_auth_on(tmp_path: Path) -> None:
+    """给出令牌表路径即隐式开启鉴权（与 --mapping-store-path 隐式切 file 同理）。"""
+    path = write_server_config(tmp_path)
+    config = load_config(parse(["-c", str(path), "--auth-file", "tokens.json"]))
+
+    assert config.auth.enabled is True
+    assert config.auth.file == "tokens.json"
+    assert config.auth.token == ""
+
+
+def test_cli_auth_file_defaults_to_none(tmp_path: Path) -> None:
+    """三态：不给时必须是 None，否则区分不出"没给"和"给了空串"。"""
+    path = write_server_config(tmp_path)
+    args = parse(["-c", str(path)])
+    assert args.auth_file is None
+
+    # 没给时 JSON/环境变量里的设置原样保留
+    config = load_config(parse(["-c", str(path), "--token", "from-cli"]))
+    assert config.auth.file == ""
+
+
+def test_cli_no_auth_clears_both_credential_sources(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """逃生门要把**两种**凭据都清掉：只清一半会留下"关了鉴权却还挂着令牌表"的半截状态。"""
+    monkeypatch.setenv("LOCALTONET_AUTH_FILE", "from-env.json")
+    path = write_server_config(tmp_path)
+
+    config = load_config(parse(["-c", str(path), "--no-auth"]))
+
+    assert config.auth.enabled is False
+    assert config.auth.token == ""
+    assert config.auth.file == ""
+
+
+def test_cli_file_wins_over_json_token(tmp_path: Path) -> None:
+    """命令行优先级最高：显式切到令牌表就把 JSON 里的共享令牌清掉。
+
+    否则"JSON 配了 token、命令行给了 file"会撞上互斥校验，而用户做的
+    恰恰是文档里写的"命令行覆盖 JSON"。
+    """
+    path = write_server_config(tmp_path, enabled=True, token="json-secret")
+    config = load_config(parse(["-c", str(path), "--auth-file", "tokens.json"]))
+
+    assert config.auth.file == "tokens.json"
+    assert config.auth.token == ""
+    assert config.auth.enabled is True
+
+
+def test_cli_token_wins_over_json_file(tmp_path: Path) -> None:
+    payload: Dict[str, Any] = {
+        "name": "cli-test",
+        "control": {"host": "127.0.0.1", "port": 7000},
+        "data": {"host": "127.0.0.1", "port": 7001},
+        "mapping": [{"public_port": 9028, "local_port": 8000}],
+        "auth": {"enabled": True, "file": "json-tokens.json"},
+    }
+    path = tmp_path / "server.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    config = load_config(parse(["-c", str(path), "--token", "cli-secret"]))
+
+    assert config.auth.token == "cli-secret"
+    assert config.auth.file == ""
+    assert config.auth.enabled is True
+
+
+def test_cli_blank_auth_file_exits_with_code_2(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    path = write_server_config(tmp_path)
+    code = main(["-c", str(path), "--auth-file", "  "])
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "--auth-file" in err
+    assert "不能为空" in err
+
+
+def test_cli_auth_file_and_token_are_mutually_exclusive(tmp_path: Path) -> None:
+    """同一个互斥组里：既开令牌表又开共享令牌，argparse 必须当场拦下。"""
+    path = write_server_config(tmp_path)
+    with pytest.raises(SystemExit) as excinfo:
+        parse(["-c", str(path), "--auth-file", "t.json", "--token", "x"])
+
+    assert excinfo.value.code == 2
+
+
+def test_cli_auth_file_and_no_auth_are_mutually_exclusive(tmp_path: Path) -> None:
+    path = write_server_config(tmp_path)
+    with pytest.raises(SystemExit) as excinfo:
+        parse(["-c", str(path), "--auth-file", "t.json", "--no-auth"])
 
     assert excinfo.value.code == 2
 

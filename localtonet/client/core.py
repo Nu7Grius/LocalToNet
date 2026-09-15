@@ -378,9 +378,14 @@ class TunnelClient:
 
         if not ack.get("ok"):
             code = ack.get("code")
+            # retryable 由服务端下发，用来把 403 细分成"永久拒"与"端口未授权（可重试）"。
+            # 只采信真正的 bool：老服务端没这个字段（得到 None），此时 is_fatal 会
+            # 按鉴权一期语义推导（403 永久、其余暂时），保证双向兼容。
+            retryable = ack.get("retryable")
             raise RegistrationError(
                 str(ack.get("msg") or "服务端拒绝了注册"),
                 code=code if isinstance(code, int) else 500,
+                retryable=retryable if isinstance(retryable, bool) else None,
             )
 
         self._claimed = [port for port in (ack.get("claimed") or []) if isinstance(port, int)]

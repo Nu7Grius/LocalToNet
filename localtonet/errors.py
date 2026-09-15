@@ -49,9 +49,24 @@ class TunnelError(Exception):
 
 
 class AuthError(TunnelError):
-    """客户端鉴权失败。"""
+    """客户端鉴权失败（HTTP 语义上的 ``403``）。
+
+    ``retryable`` 把 ``403`` 细分成两类，默认 ``False`` ＝**永久失败**，
+    与鉴权一期的语义一字不差（老代码 ``except AuthError`` 不用改）：
+
+    * ``retryable=False`` —— 令牌无效 / 被吊销 / ``client_id`` 冒充。重试一万次结果一样。
+    * ``retryable=True`` —— **端口未授权**。改完服务端的令牌表，同一个客户端进程
+      下一轮退避重试就能自动上车（热重载闭环的落点）。
+
+    ⚠️ 不要整类改成可重试，也不要拿 ``409`` 表达"未授权"
+    （``409`` 已被"端口被别的客户端占了"占用，两者语义不同）。
+    """
 
     code = 403
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class PortConflictError(TunnelError):
@@ -110,15 +125,32 @@ class RegistrationError(TunnelError):
     """客户端向服务端注册失败。
 
     ``code`` 取自服务端 ``register_ack`` 里的 ``code`` 字段。
-    ``403`` 视为**永久性失败**（凭据不对），客户端应当停止重试——
+    ``403`` 是**永久性失败**（凭据不对 / 被吊销 / 冒名），客户端应当停止重试——
     否则会陷入"每 60 秒被拒一次"的无意义循环。
 
-    其余 ``code`` 一律按**暂时性失败**处理（继续退避重试），其中 ``503``（容量满）
-    与 ``429``（配额超限）都属于"回头可能就好了"，绝不能与 ``403`` 混同。
+    但 ``403`` 分两半：服务端可以在回执里给 ``retryable=true`` 表示
+    "你这个人是对的，只是这个端口没授权"——**这类 403 必须继续重试**，
+    因为运维改完令牌表后，同一个客户端进程应当自动上车（端口授权的热重载闭环）。
+    判据收在 :attr:`is_fatal` 里，调用方只判它，不要自己比对 ``code``。
+
+    ``retryable`` 缺省为 ``None`` ＝**老服务端没这个字段**：按鉴权一期语义推导
+    （``403`` 永久、其余暂时），保证新客户端与老服务端互通。
     """
 
     code = 500
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: Optional[int] = None,
+        retryable: Optional[bool] = None,
+    ) -> None:
+        super().__init__(message, code=code)
+        self.retryable = retryable
+
     @property
     def is_fatal(self) -> bool:
+        if self.retryable is not None:
+            return self.code == 403 and not self.retryable
         return self.code == 403

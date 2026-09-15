@@ -128,7 +128,9 @@ class TunnelServer:
         self._config = config
         self._log = logger or get_logger("server")
         self._events = events or EventBus(self._log)
-        self._auth = authenticator or build_authenticator(config.auth)
+        # 令牌表在这里载入（auth.file 模式）：文件损坏 / 缺失会直接抛 ConfigError，
+        # 由 server.py 的 serve() 归到"配置错误→退出码 2"。绝不静默降级为放行。
+        self._auth = authenticator or build_authenticator(config.auth, logger=self._log)
         # TLS 上下文在这里建一次、全程复用。绝不放到连接路径上现建——
         # 数据通道是"每个请求一条 TCP"，每条都新建 context 会让 TLS 1.3 的
         # 会话票据缓存彻底失效，等于每个请求都付一次完整握手。
@@ -375,10 +377,8 @@ class TunnelServer:
         """校验并登记客户端。返回 None 表示注册被拒（调用方负责关连接）。"""
         client_id = msg.get("client_id")
         if not isinstance(client_id, str) or not client_id.strip():
-            self._stats.registrations_rejected += 1
-            await self._send_raw(
-                writer,
-                make_msg(MsgType.REGISTER_ACK, ok=False, code=400, msg="client_id 必须是非空字符串", claimed=[], conflicts=[]),
+            await self._reject_register(
+                writer, code=400, msg="client_id 必须是非空字符串", retryable=True
             )
             return None
         client_id = client_id.strip()
@@ -386,35 +386,55 @@ class TunnelServer:
         try:
             local_ports = parse_ports(msg.get("local_ports"))
         except ConfigError as exc:
-            self._stats.registrations_rejected += 1
-            await self._send_raw(
-                writer,
-                make_msg(MsgType.REGISTER_ACK, ok=False, code=400, msg=exc.message, claimed=[], conflicts=[]),
-            )
+            # 400＝客户端自己的参数写错了：改完配置重试有意义，所以归到可重试
+            await self._reject_register(writer, code=400, msg=exc.message, retryable=True)
             return None
 
         try:
-            self._auth.verify(msg, peer)
+            # verify 返回**身份**（是谁 + 允许认领哪些内网端口），失败抛 AuthError。
+            # 令牌表的热重载就在它内部的第一步，所以"改文件 → 下一次注册尝试即生效"。
+            identity = self._auth.verify(msg, peer)
         except AuthError as exc:
-            self._stats.registrations_rejected += 1
             self._log.warning("拒绝客户端 %s（%s）：%s", client_id, peer, exc)
-            await self._send_raw(
-                writer,
-                make_msg(MsgType.REGISTER_ACK, ok=False, code=exc.code, msg=exc.message, claimed=[], conflicts=[]),
-            )
+            await self._reject_register(writer, code=exc.code, msg=exc.message, retryable=exc.retryable)
             return None
 
         if not self._registry.has(client_id) and self._registry.client_count >= self._config.limits.max_clients:
             reason = f"在线客户端数已达上限 {self._config.limits.max_clients}"
-            self._stats.registrations_rejected += 1
             self._log.warning("拒绝客户端 %s：%s", client_id, reason)
-            await self._send_raw(
-                writer,
-                make_msg(MsgType.REGISTER_ACK, ok=False, code=503, msg=reason, claimed=[], conflicts=[]),
-            )
+            # 503＝"服务端没位置了"，回头可能就好 → 可重试
+            await self._reject_register(writer, code=503, msg=reason, retryable=True)
             return None
 
-        session = ClientSession(client_id=client_id, reader=reader, writer=writer, peer=peer, register_msg=dict(msg))
+        # 端口授权：刻意放在容量判定**之后**、登记会话**之前**。
+        # 之后＝容量满时先报"整机满了"（503）比"你没这个端口的权限"更贴近实情；
+        # 之前＝此时 registry 还没动过，拒绝不留任何脏状态（不必回滚端口归属）。
+        unauthorized = [port for port in local_ports if not identity.allows(port)]
+        if unauthorized:
+            # **整体拒绝，绝不部分接受**："这台机器只暴露了一半端口"是极难排查的状态。
+            # retryable=True 是热重载闭环的落点：运维把端口加进令牌表后，
+            # 同一个客户端进程下一轮退避重试就会自动上车，不需要重启客户端。
+            reason = (
+                f"端口未授权：{unauthorized}（身份 {identity.name} 允许的内网端口："
+                f"{identity.ports or '不限'}）"
+            )
+            self._log.warning("拒绝客户端 %s（%s）：%s", client_id, peer, reason)
+            await self._reject_register(writer, code=403, msg=reason, retryable=True)
+            return None
+
+        # ⚠️ 注册消息里带着**令牌明文**，绝不能原样存进会话（MEMORY 不变量 1）。
+        # 会话对象会被快照、被调试器、被将来的管理 API 顺手打出来；存一份令牌
+        # 等于把明文扩散到内存各处，还会顺着日志与事件漏出去。
+        # 要身份请读 session.identity —— 那是令牌表里的 name，不是密钥。
+        sanitized = {key: value for key, value in msg.items() if key != "token"}
+        session = ClientSession(
+            client_id=client_id,
+            reader=reader,
+            writer=writer,
+            peer=peer,
+            identity=identity.name,
+            register_msg=sanitized,
+        )
 
         previous = self._registry.add(session)
         if previous is not None:
@@ -430,6 +450,11 @@ class TunnelServer:
             MsgType.REGISTER_ACK,
             ok=True,
             msg="注册成功",
+            # 成功路径也显式给出 retryable=False：客户端不必"缺字段就推导"，
+            # 日志与界面可以直接读它，语义只有一处（is_fatal）
+            retryable=False,
+            # 身份标签（不是令牌）——可观测性：日志/事件/GUI 能回答"在线的是谁"
+            identity=identity.name,
             client_id=client_id,
             claimed=claimed,
             conflicts=conflicts,
@@ -444,9 +469,10 @@ class TunnelServer:
             return None
 
         self._log.info(
-            "客户端 %s（%s）已上线，认领端口 %s%s",
+            "客户端 %s（%s）已上线，身份 %s，认领端口 %s%s",
             client_id,
             peer,
+            identity.name,
             claimed or "无",
             f"，冲突被拒 {conflicts}" if conflicts else "",
         )
@@ -454,11 +480,41 @@ class TunnelServer:
             EventType.CLIENT_CONNECTED,
             client_id=client_id,
             peer=peer,
+            identity=identity.name,
             claimed=claimed,
             conflicts=conflicts,
         )
         await self._broadcast_mapping_list()
         return session
+
+    async def _reject_register(
+        self,
+        writer: asyncio.StreamWriter,
+        *,
+        code: int,
+        msg: str,
+        retryable: bool,
+    ) -> None:
+        """回一条"注册被拒"的 ``register_ack``，并记账。
+
+        ``retryable`` 是 ``403`` 的细分（见 :class:`RegistrationError`）：
+        ``400``（客户端参数错）、``503``（容量满）与"端口未授权"都是**暂时**失败，
+        客户端应当继续退避重试；只有"令牌无效 / 被吊销 / ``client_id`` 冒充"是**永久**失败。
+        集中在这里生成回执，就不会出现"某个分支忘了带 retryable"的静默退化。
+        """
+        self._stats.registrations_rejected += 1
+        await self._send_raw(
+            writer,
+            make_msg(
+                MsgType.REGISTER_ACK,
+                ok=False,
+                code=code,
+                msg=msg,
+                retryable=retryable,
+                claimed=[],
+                conflicts=[],
+            ),
+        )
 
     async def _disconnect_session(
         self,

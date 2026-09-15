@@ -7,7 +7,9 @@ server.py —— 服务端入口（公网侧）
     python server.py                          # 读取同目录 config.json
     python server.py -c my.json               # 指定配置
     python server.py --mapping 9028:8000      # 临时映射，覆盖配置文件里的 mapping
-    python server.py --token s3cret           # 开启 token 鉴权
+    python server.py --token s3cret           # 开启 token 鉴权（单一共享令牌）
+    python server.py --auth-file tokens.json  # 开启令牌表鉴权：多令牌 + 身份 + 按内网端口授权，
+                                              # 改文件最迟在下一次注册尝试生效，不必重启
     python server.py --no-auth                # 强制关闭鉴权（覆盖 JSON / 环境变量）
     python server.py --mapping-store file --mapping-store-path mappings.json
                                               # 映射持久化，重启后映射还在
@@ -88,6 +90,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="开启 token 鉴权（等价于 auth.enabled=true + auth.token），客户端须带同一令牌",
     )
     auth_group.add_argument(
+        "--auth-file",
+        metavar="路径",
+        help="开启令牌表鉴权并指定 JSON 文件（等价于 auth.enabled=true + auth.file）；"
+        "每个令牌自带身份与允许认领的内网端口，改文件最迟在下一次注册尝试生效（不必重启）。"
+        "令牌表与 --token 互斥",
+    )
+    auth_group.add_argument(
         "--no-auth",
         action="store_true",
         help="强制关闭鉴权，覆盖配置文件与环境变量里的设置（本地演示用）",
@@ -163,15 +172,28 @@ def load_config(args: argparse.Namespace) -> ServerConfig:
         config.mapping_store.path = args.mapping_store_path
         config.mapping_store.type = "file"
     # 鉴权：命令行优先级最高（默认值 < JSON < 环境变量 < 命令行）。
-    # --token 的 default 必须是 None，否则无法区分"没给"和"给了空串"。
+    # 令牌表与共享令牌的 default 都必须是 None，否则无法区分"没给"和"给了空串"。
     if args.no_auth:
+        # 逃生门要把**两种**凭据都清掉：只清一半会留下"关了鉴权却还挂着令牌表文件"
+        # 的半截状态，等下一次有人打开 enabled 就会莫名其妙按旧文件鉴权
         config.auth.enabled = False
         config.auth.token = ""
+        config.auth.file = ""
+    if args.auth_file is not None:
+        if not args.auth_file.strip():
+            raise ConfigError("--auth-file 不能为空；若要关闭鉴权请改用 --no-auth")
+        config.auth.file = args.auth_file
+        # 命令行优先级最高：显式切到令牌表，就把另一条凭据来源清掉。
+        # 否则"JSON 里配了 token、命令行又给了 file"会撞上互斥校验，
+        # 而用户做的恰恰是文档里写的"命令行覆盖 JSON"。
+        config.auth.token = ""
+        config.auth.enabled = True  # 给出文件即隐式开启（与 --mapping-store-path 先例一致）
     if args.token is not None:
         token = args.token.strip()
         if not token:
             raise ConfigError("--token 不能为空；若要关闭鉴权请改用 --no-auth")
         config.auth.token = token
+        config.auth.file = ""  # 同上：显式切回共享令牌，清掉令牌表
         config.auth.enabled = True
     # TLS：命令行优先级最高。--no-tls 是逃生门；--tls-cert/--tls-key 给出即隐式开启
     # （与 --mapping-store-path 隐式切 file 同理，避免"路径都填了却漏了开关"）。

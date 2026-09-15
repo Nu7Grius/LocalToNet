@@ -36,21 +36,21 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CLIENT = REPO_ROOT / "client.py"
 
 
-def _rejecting_handler(code: int, message: str):
+def _rejecting_handler(code: int, message: str, *, retryable: bool | None = None):
     async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             await recv_msg(reader)  # register_client
-            await send_msg(
-                writer,
-                make_msg(
-                    MsgType.REGISTER_ACK,
-                    ok=False,
-                    code=code,
-                    msg=message,
-                    claimed=[],
-                    conflicts=[],
-                ),
-            )
+            payload: dict[str, Any] = {
+                "ok": False,
+                "code": code,
+                "msg": message,
+                "claimed": [],
+                "conflicts": [],
+            }
+            # 老服务端不带 retryable —— 默认就是"不带这个字段"的形态
+            if retryable is not None:
+                payload["retryable"] = retryable
+            await send_msg(writer, make_msg(MsgType.REGISTER_ACK, **payload))
         except Exception:  # noqa: BLE001 - 测试收尾噪音一律吞掉
             pass
         finally:
@@ -198,3 +198,74 @@ def test_tls_client_against_plaintext_server_exits_with_code_1() -> None:
     proc = asyncio.run(scenario())
 
     assert proc.returncode == 1, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+
+
+def test_403_without_retryable_field_stays_permanent() -> None:
+    """老服务端不带 ``retryable`` 字段 → 按鉴权一期语义推导：403 仍是**永久**失败。
+
+    这条钉的是**互通性**：新客户端不能因为服务端不认识新字段就无限重试刷日志。
+    """
+
+    async def scenario() -> subprocess.CompletedProcess[str]:
+        port = free_ports(1)[0]
+        server = await asyncio.start_server(
+            _rejecting_handler(403, "客户端提供的 token 不合法"), "127.0.0.1", port
+        )
+        try:
+            return await asyncio.to_thread(
+                run_client,
+                ["--server", f"127.0.0.1:{port}", "--local-ports", "8000", "--token", "wrong"],
+            )
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    proc = asyncio.run(scenario())
+
+    assert proc.returncode == 1, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    assert "403" in proc.stdout
+
+
+def test_403_with_retryable_true_keeps_client_running() -> None:
+    """``403 + retryable=true``（端口未授权）必须**继续重试**，进程不许退出。
+
+    这是鉴权二期最容易做错的一处：它也是 403，但它不是"你没资格"，
+    而是"这个端口你没被授权"——运维改完服务端令牌表后，同一个客户端进程
+    应当自己上车（热重载闭环）。把它并进"403 一律停手"就断掉了这个闭环。
+    """
+
+    async def scenario() -> Any:
+        port = free_ports(1)[0]
+        server = await asyncio.start_server(
+            _rejecting_handler(403, "端口未授权：[8000]", retryable=True), "127.0.0.1", port
+        )
+        proc: subprocess.Popen[str] | None = None
+        try:
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(CLIENT),
+                    "--server",
+                    f"127.0.0.1:{port}",
+                    "--local-ports",
+                    "8000",
+                    "--token",
+                    "whatever",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            # client.json 的 reconnect.initial_delay = 1s，等它至少退避重试一轮
+            await asyncio.sleep(1.5)
+            assert proc.poll() is None, "可重试的 403 不该让客户端退出"
+        finally:
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(proc.wait, 10)
+            server.close()
+            await server.wait_closed()
+        return proc
+
+    asyncio.run(scenario())

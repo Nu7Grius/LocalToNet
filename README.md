@@ -18,6 +18,9 @@
 - **指数退避重连**：1s → 2s → 4s → … → 60s 封顶，成功即归零
 - **明确错误语义**：404 / 502 兜底，绝不留下"空回复"
 - **可选共享令牌鉴权**：一行 `--token` 开启；令牌错了立刻停手（403），容量满了继续重试（503）
+- **令牌表鉴权（多身份 + 端口授权 + 热重载）**：`--auth-file tokens.json` 给每个令牌带上身份与
+  允许认领的内网端口；改动文件最迟在下一次注册尝试生效，**不必重启**；未授权端口**整体拒绝**
+- **明确的 `403` 细分**：令牌无效＝永久失败（客户端停手），端口未授权＝可重试（改完令牌表自动上车）
 - **带宽限流**：按客户端、按方向（上行/下行）独立限速，令牌桶平滑而非"每秒硬切"
 - **并发配额**：限制单客户端同时在途的转发数，超了直接回 `429`，不排队、不拖垮服务端
 - **映射持久化**：`--mapping-store file` 把映射表落到 JSON，重启服务端不再回到配置文件的状态
@@ -94,44 +97,130 @@ python client.py --server 1.2.3.4:7000 --local-ports 8000,8080 --client-id my-pc
 
 ## 开启鉴权
 
-默认 `auth.enabled=false`，开箱即用的本地演示不需要任何令牌。公网部署建议开启**共享令牌**：
-服务端校验客户端在 `register_client` 帧里带的 `token`，不匹配就回 `403` 并拒掉连接。
+默认 `auth.enabled=false`，开箱即用的本地演示不需要任何令牌。公网部署有**两种**凭据来源，
+**二选一**：
 
-| 位置 | 方式 | 示例 |
+| 方式 | 适用 | 特点 |
 | --- | --- | --- |
-| 服务端 | 命令行 | `python server.py --token s3cret` |
-| 服务端 | 环境变量 | `LOCALTONET_AUTH_TOKEN=s3cret python server.py` |
-| 服务端 | 配置文件 | `config.json` 的 `"auth": { "enabled": true, "token": "s3cret" }` |
-| 客户端 | 命令行 | `python client.py --server 1.2.3.4:7000 --local-ports 8000 --token s3cret` |
-| 客户端 | 环境变量 | `LOCALTONET_AUTH_TOKEN=s3cret python client.py …` |
-| 客户端 | 配置文件 | `client.json` 的 `"auth_token": "s3cret"` |
+| 共享令牌 `auth.token` | 本地演示、整个内网就是一个信任域 | 一个口令，谁拿到都能认领任意端口；换令牌要重启 |
+| 令牌表 `auth.file` | 生产 | 每个令牌带**身份**与**允许认领的内网端口**；改文件即生效，不必重启 |
 
-`gui.py` 的参数与 `client.py` **完全一致**，`--token` 在界面上同样生效。
+两者**互斥**：同时给出会被 `auth.validate()` 拦下、以退出码 `2` 结束——只允许一个凭据来源，
+不让运维猜"到底哪个生效"（哪怕 `enabled=false` 也照报）。
 
-> 服务端 `--token` 与客户端 `--token` 填的是**同一个共享密钥**，两端差一个字都连不上。
-> 本地演示临时要关掉配置文件里开着的鉴权，用 `--no-auth` 覆盖即可（命令行优先级最高）。
-> 二者互斥，同时给出会被参数解析拦下并以退出码 `2` 结束。
+### 怎么配
+
+| 位置 | 共享令牌 | 令牌表 |
+| --- | --- | --- |
+| 服务端命令行 | `python server.py --token s3cret` | `python server.py --auth-file tokens.json` |
+| 服务端环境变量 | `LOCALTONET_AUTH_TOKEN=s3cret` | `LOCALTONET_AUTH_FILE=tokens.json` |
+| 服务端配置文件 | `"auth": { "enabled": true, "token": "s3cret" }` | `"auth": { "enabled": true, "file": "tokens.json" }` |
+| 客户端命令行 | `python client.py --server 1.2.3.4:7000 --local-ports 8000 --token <令牌>` | 同左 |
+| 客户端环境变量 | `LOCALTONET_AUTH_TOKEN=<令牌>` | 同左 |
+| 客户端配置文件 | `client.json` 的 `"auth_token": "<令牌>"` | 同左 |
+
+给 `--auth-file` / `LOCALTONET_AUTH_FILE` / `auth.file` 任一即**隐式开启**鉴权
+（与 `--mapping-store-path` 隐式切 `file` 同理）。
+
+命令行优先级最高，所以它是**切换凭据来源**的完整动作：`--auth-file` 会清掉配置里的 `auth.token`，
+`--token` 会清掉 `auth.file`。否则"JSON 里配了 token、命令行给了 file"会撞上互斥校验，
+而用户做的恰恰是文档里写的"命令行覆盖 JSON"。`--no-auth` 把两者一起清空——
+只清一半会留下"关了鉴权却还挂着令牌表"的半截状态。
+
+> `gui.py` 的参数与 `client.py` **完全一致**，`--token` 在界面上同样生效。
+> 令牌表是**服务端运维面**的东西，客户端界面刻意不做令牌表控件。
+> 互斥的参数同时给出会被 argparse 拦下并以退出码 `2` 结束。
+
+### 令牌表格式
+
+```json
+{
+  "version": 1,
+  "tokens": [
+    { "name": "nas", "token": "plaintext-for-local-demo", "ports": [8000, 8080] },
+    { "name": "ci",  "token_sha256": "把 sha256 的 hexdigest 填在这里", "client_id": "ci-runner-01" },
+    { "name": "old", "token": "whatever", "enabled": false }
+  ]
+}
+```
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `version` | 否 | 只接受 `1`；将来改格式用它挡住老文件 |
+| `tokens` | 是 | 条目数组，**不能为空**——空表会拒掉所有人，属于配置错误而不是"关闭鉴权" |
+| `tokens[].name` | 是 | 身份标签，进日志、`CLIENT_CONNECTED.identity` 与 `ClientSession.identity`；必须唯一 |
+| `tokens[].token` | 二选一 | **明文**令牌，便于本地演示 |
+| `tokens[].token_sha256` | 二选一 | `sha256(令牌).hexdigest()`，64 位 hex，**推荐生产**（文件里不落明文） |
+| `tokens[].client_id` | 否 | 给出则注册的 `client_id` 必须完全相等（防偷令牌换身份）；空＝不校验 |
+| `tokens[].ports` | 否 | 允许认领的**内网端口**；**空或省略＝不限** |
+| `tokens[].enabled` | 否 | `false` ＝吊销。条目仍参与比较，但一律拒之门外 |
+
+明文与哈希**同时给出会报错**：两份凭据＝让运维猜哪个生效，本项目一律 fail fast。
+未知字段（顶层或条目内）同样直接报错，不静默忽略——写错字段名却照跑最难排查。
+
+比对一律走 `hmac.compare_digest`，且**遍历全部条目**、最后才取命中项：
+命中即返回会从耗时上泄漏"第几条匹配上了"（时序侧信道）；被吊销的条目也必须参与比较，
+否则"存在但被吊销"与"根本不存在"在耗时上可区分。
+
+### `ports` 约束的是**内网端口**
+
+`ports` 针对客户端注册时声明的 `local_ports`（**不是**公网端口）。选它有两个理由：
+授权点与协议字段一一对应、不引入额外映射；"这台机器能暴露哪些内网服务"本身就是最小权限的
+自然表达。
+
+**空 `ports` ＝不限**（与 `limits` 里的 `0` ＝不限一脉相承）。要禁止一切认领请用 `enabled: false`。
+
+声明了未授权的端口 → **整体拒绝注册**，`msg` 里列出未授权的端口，**不做部分接受**：
+部分成功会造成"这台机器只暴露了一半端口"这种极难排查的状态。
+
+### 热重载：改文件即生效，不必重启
+
+服务端在每次收到 `register_client`、**校验之前**比一次令牌文件的 `mtime + size`，变了就重载。
+**没有后台轮询任务**——语义因此很清楚："改文件 → 最迟在下一次注册尝试生效"，
+而客户端的退避重试会自然触发下一次尝试。
+
+| 情况 | 行为 |
+| --- | --- |
+| 新增 / 修改条目 | 下一次注册尝试即生效，日志打 `令牌表已重载：N 条` |
+| 文件损坏 / 消失 / 解析失败 | **保留旧表** + ERROR 日志，**绝不降级为放行** |
+| 空 `tokens` 数组 | 配置错误：启动时 fail fast（退出码 `2`）；运行期重载则保留旧表 |
+
+### `403` 的两半：`retryable`
+
+`register_ack` 新增 `retryable`，把 `403` 细分开：
+
+| 拒绝原因 | `code` | `retryable` | 客户端行为 |
+| --- | --- | --- | --- |
+| 令牌无效 / 被吊销 / `client_id` 冒充 | `403` | `false` | **永久失败** → 停止重试，状态 `stopped` |
+| **端口未授权** | `403` | `true` | **暂时失败** → 继续退避重试，改完令牌表自动上车 |
+| 在线客户端数已达 `limits.max_clients` | `503` | `true` | 继续退避重试 |
+| `client_id` / 端口列表非法 | `400` | `true` | 继续退避重试（改配置就能好） |
+| 注册成功（`ok=true`） | 不带 `code` | `false` | — |
+
+判据统一收在 `RegistrationError.is_fatal`（`code == 403 and not retryable`），客户端只判它。
+`retryable` 字段**缺失**时按鉴权一期语义推导（`403` 永久、其余暂时），新客户端与老服务端互通。
+
+> ⚠️ 不要把 `403` 整类改成可重试，也不要用 `409` 表达"未授权"：`409` 已被"端口被别的客户端占了"
+> 占用，`429` / `503` 也各有明确语义（`429`＝"你的额度用完了"、`503`＝"整机满了"），**四者不可统一**。
 
 ### 忘了配客户端令牌会怎样
 
 症状很明确，不会含糊成"连不上，原因不明"：
 
-1. 服务端日志出现 `拒绝客户端 test-xxx（127.0.0.1:xxxxx）：客户端 … 提供的 token 不合法`；
-2. 客户端收到 `code=403`，状态直接变 `stopped` 并**停止重试**，
-   日志写 `注册被永久拒绝（[403] …），停止重试`，事件总线发一条 `CONTROL_LOST(fatal=True)`
+1. 服务端日志 `拒绝客户端 test-xxx（127.0.0.1:xxxxx）：客户端 … 提供的令牌不在令牌表中`；
+2. 客户端收到 `403, retryable=false`，状态变 `stopped` 并**停止重试**，日志写
+   `注册被永久拒绝（[403] …），停止重试`，事件总线发一条 `CONTROL_LOST(fatal=True)`
    （GUI 的事件日志里能看到）。
 
 这是故意的：凭据不对，重试一万次结果也一样，每 60 秒撞一次墙只会刷满日志、掩盖真正的问题。
+反例正是**端口未授权**：它是 `403, retryable=true`，客户端**继续重试**，
+界面显示"重连中（第 N 次）"而不是"已停止重试"——这就是热重载闭环能闭合的原因。
 
-| 拒绝原因 | `code` | 客户端行为 |
-| --- | --- | --- |
-| 令牌错误 / 根本没带令牌 | `403` | **永久失败** → 停止重试，状态 `stopped` |
-| 在线客户端数已达 `limits.max_clients` | `503` | **暂时失败** → 继续指数退避重试 |
-| `client_id` 非法 / 端口列表非法 | `400` | 继续退避重试（改配置就能好） |
-
-> ⚠️ 令牌目前是**明文**放在 `register_client` 帧里走 TCP，`client.json` 里也是明文落盘。
+> ⚠️ 令牌是**明文**放在 `register_client` 帧里走 TCP 的（令牌表文件里也可能明文）。
 > 公网部署请至少开启「传输加密（TLS）」（控制+数据两跳），需要访客侧也加密时再按
 > 「访客端口 TLS」逐端口打开；置于 Nginx / Caddy 之后同样可行。
+> 令牌表文件的权限（`chmod 600` 之类）由**运维自己收紧**：跨平台做不了可靠的权限检查，
+> 程序不做、也不假装做。
 
 ## 传输加密（TLS）
 
@@ -396,7 +485,8 @@ LocalToNet/
 │   │   ├── registry.py       在线客户端表 + 端口归属路由
 │   │   ├── pending.py        访客连接与数据通道的配对挂起
 │   │   ├── mapping.py        映射表、存储后端（内存 / JSON 文件）与访客端口监听生命周期
-│   │   └── auth.py           鉴权（放行 / 共享令牌，常量时间比较）
+│   │   ├── tokenstore.py     令牌表（解析 / 常量时间比对 / mtime 惰性热重载）
+│   │   └── auth.py           鉴权（放行 / 共享令牌 / 令牌表，返回身份 + 允许的内网端口）
 │   ├── client/               客户端
 │   │   ├── core.py           控制长连接、心跳、重连
 │   │   └── forwarder.py      数据通道 + 内网后端连接
@@ -428,7 +518,7 @@ LocalToNet/
 | 指令 | 方向 | 载荷 | 用途 |
 | --- | --- | --- | --- |
 | `register_client` | 客户端 → 服务端 | `client_id`, `local_ports`, `token`, `version`, `hostname` | 注册身份并认领本地端口 |
-| `register_ack` | 服务端 → 客户端 | `ok`, `code`, `msg`, `claimed`, `conflicts`, `data_host`, `data_port` | 回执认领结果与数据通道地址 |
+| `register_ack` | 服务端 → 客户端 | `ok`, `code`, `msg`, `retryable`, `identity`, `claimed`, `conflicts`, `data_host`, `data_port` | 回执认领结果与数据通道地址 |
 | `mapping_list` | 服务端 → 客户端 | `mapping` | 下发当前映射表 |
 | `new_conn` | 服务端 → 客户端 | `conn_id`, `local_port`, `public_port` | 通知客户端开一条转发 |
 | `register` | 客户端 → 服务端（数据通道） | `conn_id` | 数据通道配对 |
@@ -548,7 +638,9 @@ Linux 上若缺 tkinter，安装系统包 `python3-tk` 即可（Windows/macOS �
 | --- | --- | --- | --- |
 | 帧编解码 | `protocol.Codec` | 长度头 + JSON | msgpack / protobuf / 压缩 |
 | 指令处理 | `core.dispatcher.MessageDispatcher` | `@handler` 注册表 | 新增指令零侵入主循环 |
-| 客户端鉴权 | `server.auth.Authenticator` | `NoneAuthenticator` / `TokenAuthenticator`（共享令牌） | mTLS / 签名挑战 / SSO |
+| 客户端鉴权 | `server.auth.Authenticator` | `NoneAuthenticator` / `LegacyTokenAuthenticator`（共享令牌）/ `TokenFileAuthenticator`（令牌表：多身份 + 内网端口授权 + 文件热重载） | mTLS / 签名挑战 / SSO |
+| 令牌表存储 | `server.tokenstore.TokenStore` | JSON 文件 + mtime 惰性热重载 | KMS / Vault / 数据库 |
+| 身份标签的用途 | `server.auth.Identity` | 日志 / 事件 / `ClientSession.identity` | 按身份路由、审计、按身份限速 |
 | 端口路由策略 | `ClientRegistry(routing=...)` | 归属优先 → 首个在线 | 轮询 / 加权 / 标签路由 |
 | 映射持久化 | `server.mapping.MappingStore` | 内存 / JSON 文件（原子写） | SQLite / Redis |
 | 映射校验规则 | `core.rules.parse_mapping` | 服务端与 GUI 共用一份 | 增删规则只改这一处 |
@@ -591,8 +683,7 @@ test_tls 10 / test_visitor_tls 13 / test_gui_model 49 / test_gui_bridge 10 / tes
 | 令牌错误 | `403` → 客户端**只拨号一次**、状态 `stopped`、`CONTROL_LOST(fatal=True)` |
 | 令牌缺失 | 同上，症状与令牌错误完全一致 |
 | 容量已满 | `503` **不**被当成 fatal，客户端继续退避重试；已在线客户端不受影响 |
-| 带宽限流 | 限速后同一份数据的耗时**明显长于**不限速基线，且字节数一个不少 |
-| 并发配额 | 打满 `max_conns_per_client` 后新请求回 `429`；在途请求照常返回 200 |
+| 带宽限流 | 限速后同一份数据的耗时**明显长于**不限速基线，且字节数一个不少 || 并发配额 | 打满 `max_conns_per_client` 后新请求回 `429`；在途请求照常返回 200 |
 | 在线数观测 | `stats.clients_online` 随客户端上下线增减 |
 | 运行期持久化 | `set_mapping` 后映射文件立刻出现新端口 |
 | 重启后存活 | 换一个 `TunnelServer` 实例重启，仍监听上次持久化的端口，而 `config.json` 里的端口未生效 |
@@ -616,19 +707,33 @@ TLS 访客打明文端口都必须拿不到数据，否则"配置里多了几个
 **热切换**（切 `tls` 时 `diff.changed` 有它、监听重建、握手协议真的换了；缺证书的更新必须在
 停监听**之前**被拒，端口仍能正常服务）。
 
+`tests/test_auth_tokens.py`（36 项）是鉴权二期的主战场，全部走真实三件套，守五条线：
+**兼容**（不配 `auth.file` 时单令牌路径一字不差，旧类名 `TokenAuthenticator` 仍是同一对象）；
+**授权**（白名单内可认领、`ports: []` ＝不限、`client_id` 绑定通过/冒充被拒、
+声明未授权端口 → **整体拒绝**且连授权过的那个端口也没被认领、随后能被别的客户端干净拿走）；
+**热重载闭环**（未授权 → 改服务端令牌文件 → **同一个客户端进程**自动上车：只断言 `retryable`
+是不够的，那只能证明服务端"说了可重试"，证明不了"重试真能上车"）；
+**热重载与安全铁律**（新增令牌无需重启即生效；文件**损坏 / 被删**时旧令牌仍能连、
+未知令牌仍不能连——只测前半句在"降级为放行"的实现下也成立，必须配上后半句才算证伪 fail-open；
+空 `tokens` 在启动时就 fail fast）；
+**不泄漏**（抓 `localtonet` 全量日志含 DEBUG 与异常栈 + `CLIENT_CONNECTED` 事件载荷 +
+`session.register_msg`，断言令牌明文一次都不出现；比较函数计数 == 条目数，钉住时序侧信道）。
+
 `tests/test_limiter.py` 用假时钟（记录每次 sleep 的时长）断言令牌桶**真的在等**而不是空转：
 初始桶是满的、请求大于桶容量时被拆分且总量守恒、`rate <= 0` 被拒、禁用时不创建任何桶。
 `tests/test_mapping_store.py` 覆盖文件后端的原子写、损坏文件的 fail fast、写入失败的降级，
 以及"落盘文件权威、`config.json` 只当种子"这条语义（内存后端同样遵守，因为是存储层语义）。
 
-`tests/test_server_cli.py` 覆盖服务端命令行参数（`--token` / `--no-auth` / `--mapping-store*` /
-`--tls-cert` / `--tls-key` / `--tls-client-ca` / `--no-tls` 与配置优先级铁律），其中一条专门钉死
-"仓库自带的 `config.json` 必须保持 `auth.enabled=false` 且 `tls.enabled=false`"——
+`tests/test_server_cli.py` 覆盖服务端命令行参数（`--token` / `--auth-file` / `--no-auth` /
+`--mapping-store*` / `--tls-cert` / `--tls-key` / `--tls-client-ca` / `--no-tls` 与配置优先级铁律），
+其中一条专门钉死"仓库自带的 `config.json` 必须保持 `auth.enabled=false` 且 `tls.enabled=false`"——
 免得哪天演示配置被顺手改成要令牌/要证书，本地 demo 突然跑不起来。
 
 `tests/test_client_cli.py` 用子进程跑真实 `client.py` 对着一个"必定拒绝"的假服务端，钉死
 **退出码契约**：令牌错 → `1`；配置缺失 → `2`；`503` → 进程**继续活着**（不是启动即退）；
-TLS 客户端连明文服务端 → `1`（TLS 错配是永久失败）；以及回执消息里**不带** `[403]` 前缀。
+`403 + retryable=true`（端口未授权）→ 进程也**继续活着**；403 但**不带** `retryable` 字段
+（老服务端）→ 仍是永久失败、退出码 `1`；TLS 客户端连明文服务端 → `1`；
+以及回执消息里**不带** `[403]` 前缀。
 
 `tests/test_core.py` 另有针对 `pipe_both` 交叉配对的回归用例——
 上行与下行必须写向**对侧**，写成 `a_reader → a_writer` 就成了原地回环，
@@ -656,9 +761,20 @@ GUI 相关的三项测试（`test_gui_model` / `test_gui_bridge` / `test_gui_con
 - **传输默认仍是明文**：不配 `tls` 时，令牌放在 `register_client` 帧里走 TCP。开 TLS 后**线路上**不再明文
   （控制+数据两跳），但 `client.json` 里的 `auth_token` 仍是明文落盘、`--token` 会出现在进程列表里——
   这两条 TLS 解决不了，生产环境优先用环境变量或受限权限的配置文件
-- 鉴权只有**共享令牌**，没有按客户端区分身份：持有令牌的客户端可以认领任意访客端口；
-  mTLS（`require_client_cert`）能在传输层加一道客户端证书身份，但分发/轮换客户端证书本身是运维负担
-- 令牌是**静态**的：轮换需要重启服务端（换成 mTLS / 签名挑战 / 一次性票据见扩展点表）
+- 鉴权有两种凭据来源：**共享令牌**（不区分身份，持有者能认领任意访客端口）与**令牌表**
+  （按身份区分、按内网端口授权）。mTLS（`require_client_cert`）能在传输层再加一道客户端证书身份，
+  但分发/轮换客户端证书本身是运维负担
+- **已建立的连接不因令牌轮换而断开**：热重载只影响**新注册**。要踢掉一台已连上的机器，
+  收紧它的 `ports`（并在它重连时生效）或手动断开连接；"身份变更即断连"需要额外的语义，
+  且会与重连风暴纠缠，本轮刻意不做
+- 令牌表的 `ports` **只约束内网端口**（`local_ports`）：公网端口由服务端映射表决定，
+  两者是不同层的权限
+- 令牌表文件的权限（`chmod 600` 之类）**由运维自己收紧**：跨平台做不了可靠的权限检查，
+  程序不做、也不假装做
+- 令牌表**没有过期时间（TTL）**、不做 per-token 限流、不做定时踢人：本轮只做身份 + 授权 + 热重载。
+  吊销靠 `enabled: false`，且同样只影响新注册（见上一条）
+- 令牌是**静态**的：共享令牌模式下轮换需要重启服务端；令牌表模式改文件即生效
+  （换成 mTLS / 签名挑战 / 一次性票据见扩展点表）
 - 访客端口 TLS **只做单向认证**：访客是公网陌生人，不支持也不打算支持 mTLS
 - 访客端口 TLS 的证书是**一份服务所有端口**：per-port 只控开关，不能逐端口配不同证书；
   证书路径**只在重启时生效**（改证书文件需重启服务端），能热切的只有开关

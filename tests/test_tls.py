@@ -102,12 +102,29 @@ def test_plaintext_client_cannot_reach_tls_server() -> None:
             configure_client=lambda c: setattr(c, "tls", ClientTlsConfig()),  # 明文客户端
             expect_online=False,
         ) as harness:
-            # 明文流量被 TLS 服务端拒之门外：无论客户端重试多少次，服务端都不该登记它
-            await asyncio.sleep(0.5)  # 给客户端几次退避重试的机会
-            assert harness.client is not None
-            assert harness.server.registry.get(harness.client.client_id) is None
-            # 客户端侧佐证：它从未进入 online 状态（控制通道都通不过）
-            assert harness.client.state != "online"
+            # 明文流量被 TLS 服务端拒之门外：无论客户端重试多少次，服务端都不该登记它。
+            #
+            # ⚠️ 这里刻意**不用** `await asyncio.sleep(0.5)` 再断言（原写法，实测约 1/5 次全量会红）：
+            # 明文 TCP 连接是**能连上**的（TLS 握手在服务端才失败），客户端每轮都会把状态
+            # 置成 online 再退回 reconnecting；睡够时间只是把"撞上 online 瞬态"的概率压低，
+            # 却从来没消除它，还违反 MEMORY 里"禁止睡一觉再断言，一律轮询到达条件 + 死线"。
+            # 现在的证伪方式是两条客观证据，不看瞬态状态：
+            #   ① 先等到它**确实反复试过**（退避重连 ≥ 2 次）——否则"没登记"可能只是"还没来得及试"；
+            #   ② 再断言服务端从未登记 / 从未成功注册，且客户端从未发出 CLIENT_REGISTERED。
+            client = harness.client
+            assert client is not None
+            registered: list = []
+            client.events.on(EventType.CLIENT_REGISTERED, lambda **payload: registered.append(payload))
+
+            await harness.wait_until(
+                lambda: client.stats.reconnects >= 2,
+                timeout=5.0,
+                what="明文客户端退避重连 2 次",
+            )
+
+            assert harness.server.registry.get(client.client_id) is None
+            assert harness.server.stats.clients_registered == 0, "TLS 服务端不该成功注册任何客户端"
+            assert registered == [], "客户端不该收到过注册成功事件"
 
     asyncio.run(scenario())
 

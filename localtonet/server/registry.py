@@ -43,6 +43,11 @@ class ClientSession:
     reader: asyncio.StreamReader = field(repr=False)
     writer: asyncio.StreamWriter = field(repr=False)
     peer: str = ""
+    identity: str = ""
+    """令牌表里的身份标签（``anonymous`` / ``shared`` / 令牌条目的 ``name``）。
+
+    注意这是**标签**不是凭据——令牌明文绝不进会话（MEMORY 不变量 1）。
+    """
     local_ports: Set[int] = field(default_factory=set)
     connected_at: float = field(default_factory=time.monotonic)
     last_seen: float = field(default_factory=time.monotonic)

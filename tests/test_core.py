@@ -504,12 +504,17 @@ def test_watchdog_swallows_expire_errors() -> None:
 
 
 def test_none_authenticator_lets_everything_through() -> None:
-    assert NoneAuthenticator().verify({"client_id": "a"}, "127.0.0.1:1") is None
+    # 鉴权二期起 verify 返回**身份**而不是 None（"你是谁"由校验器回答，
+    # "你能认领哪些端口"由注册流程回答）。匿名身份不限端口。
+    identity = NoneAuthenticator().verify({"client_id": "a"}, "127.0.0.1:1")
+    assert identity.name == "anonymous"
+    assert identity.allows(12345)
 
 
 def test_token_authenticator_accepts_only_matching_token() -> None:
     auth = TokenAuthenticator("s3cret")
-    assert auth.verify({"token": "s3cret"}, "127.0.0.1:1") is None
+    # 共享令牌分不出身份，标签固定 shared；端口范围为空＝不限
+    assert auth.verify({"token": "s3cret"}, "127.0.0.1:1").name == "shared"
 
     with pytest.raises(AuthError):
         auth.verify({"token": "wrong"}, "127.0.0.1:1")

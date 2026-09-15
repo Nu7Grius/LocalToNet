@@ -336,6 +336,29 @@ def test_reconnecting_records_attempt_and_delay() -> None:
     assert "2.0s" in state.notice
 
 
+def test_retriable_403_is_not_folded_into_fatal() -> None:
+    """可重试的 403（端口未授权）在界面上必须是"将被重试"，不是"已停止重试"。
+
+    鉴权二期把 403 分成了两半：令牌无效 / 被吊销 / 冒充 → 永久失败（CONTROL_LOST
+    ``fatal=True``）；**端口未授权** → 可重试（只发 RECONNECTING，改完服务端令牌表
+    客户端会自己上车）。两条路径在界面上的区别是最容易做错的地方——一旦折叠，
+    用户会以为要重启客户端，而实际上什么都不用做。
+    """
+    state = apply_event(GuiState(), EventType.CONTROL_CONNECTED, host="1.2.3.4", port=7000)
+    state = apply_event(
+        state,
+        EventType.RECONNECTING,
+        reason="注册失败：[403] 端口未授权：[8000]",
+        delay=0.2,
+        attempt=1,
+    )
+
+    assert state.fatal is False
+    assert "已停止重试" not in state.notice
+    assert "已停止重试" not in state.status_line()
+    assert "重连中" in state.notice
+
+
 def test_successful_request_is_not_logged() -> None:
     """隧道跑起来后成功请求极多，逐条记日志会把面板刷爆——由计数与字节数体现。"""
     state = GuiState()

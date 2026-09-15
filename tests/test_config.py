@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from config import (
+    AuthConfig,
     ClientConfig,
     ClientTlsConfig,
     ConfigError,
@@ -126,6 +127,86 @@ def test_auth_enabled_requires_token() -> None:
     cfg.auth.enabled = True
     with pytest.raises(ConfigError, match="auth.token"):
         cfg.validate()
+
+
+# --------------------------------------------------------------------------- #
+# auth.file：令牌表（鉴权二期）
+# --------------------------------------------------------------------------- #
+
+
+def test_auth_file_defaults_to_empty() -> None:
+    """默认必须是空串——不是 None。空＝"没配令牌表"，走鉴权一期路径。"""
+    assert AuthConfig().file == ""
+    assert ServerConfig(mapping=[MappingRule(9028, 8000)]).auth.file == ""
+
+
+def test_auth_file_comes_from_json(tmp_path: Path) -> None:
+    payload = {
+        "mapping": [{"public_port": 9028, "local_port": 8000}],
+        "auth": {"enabled": True, "file": "tokens.json"},
+    }
+    path = tmp_path / "server.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    cfg = ServerConfig.from_file(path)
+
+    assert cfg.auth.enabled is True
+    assert cfg.auth.file == "tokens.json"
+    assert cfg.auth.token == ""
+
+
+def test_env_auth_file_implies_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """给出令牌表文件即隐式开启鉴权（与 --mapping-store-path 隐式切 file 同理）。"""
+    monkeypatch.setenv("LOCALTONET_AUTH_FILE", "tokens.json")
+
+    cfg = ServerConfig.from_env(ServerConfig(mapping=[MappingRule(9028, 8000)]))
+
+    assert cfg.auth.enabled is True
+    assert cfg.auth.file == "tokens.json"
+
+
+def test_env_auth_file_and_token_are_mutually_exclusive(monkeypatch: pytest.MonkeyPatch) -> None:
+    """环境变量层同时给两者也必须 fail fast，不许让运维猜哪个生效。"""
+    monkeypatch.setenv("LOCALTONET_AUTH_FILE", "tokens.json")
+    monkeypatch.setenv("LOCALTONET_AUTH_TOKEN", "s3cret")
+
+    with pytest.raises(ConfigError, match="互斥"):
+        ServerConfig.from_env(ServerConfig(mapping=[MappingRule(9028, 8000)]))
+
+
+def test_auth_token_and_file_are_mutually_exclusive() -> None:
+    """一个凭据来源：共享令牌与令牌表文件不能并存。"""
+
+    def payload(**auth: object) -> dict:
+        return {"mapping": [{"public_port": 9028, "local_port": 8000}], "auth": auth}
+
+    with pytest.raises(ConfigError, match="互斥"):
+        ServerConfig.from_dict(payload(enabled=True, token="x", file="tokens.json"))
+
+    # 哪怕 enabled=false 也照报：留着两份凭据本身就是隐患
+    with pytest.raises(ConfigError, match="互斥"):
+        ServerConfig.from_dict(payload(enabled=False, token="x", file="tokens.json"))
+
+
+def test_auth_unknown_field_is_rejected() -> None:
+    with pytest.raises(ConfigError, match="未知字段"):
+        ServerConfig.from_dict(
+            {"mapping": [{"public_port": 9028, "local_port": 8000}], "auth": {"files": "t.json"}}
+        )
+
+
+def test_auth_file_survives_roundtrip() -> None:
+    cfg = ServerConfig.from_dict(
+        {
+            "mapping": [{"public_port": 9028, "local_port": 8000}],
+            "auth": {"enabled": True, "file": "tokens.json"},
+        }
+    )
+
+    again = ServerConfig.from_dict(cfg.to_dict())
+
+    assert again.auth.file == "tokens.json"
+    assert again.auth.enabled is True
 
 
 def test_client_rejects_empty_local_ports() -> None:
