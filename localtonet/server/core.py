@@ -397,8 +397,15 @@ class TunnelServer:
         """校验并登记客户端。返回 None 表示注册被拒（调用方负责关连接）。"""
         client_id = msg.get("client_id")
         if not isinstance(client_id, str) or not client_id.strip():
+            # 刻意**不带 client_id** 上报：这里的 client_id 未经校验，可能是任意类型、
+            # 也可能是客户端塞进来的超长串（上限是 max_msg_len，10MB），
+            # 原样落日志/事件等于给对手一个日志放大器。msg 里已经说明哪里错了。
             await self._reject_register(
-                writer, code=400, msg="client_id 必须是非空字符串", retryable=True
+                writer,
+                code=400,
+                msg="client_id 必须是非空字符串",
+                retryable=True,
+                peer=peer,
             )
             return None
         client_id = client_id.strip()
@@ -407,7 +414,14 @@ class TunnelServer:
             local_ports = parse_ports(msg.get("local_ports"))
         except ConfigError as exc:
             # 400＝客户端自己的参数写错了：改完配置重试有意义，所以归到可重试
-            await self._reject_register(writer, code=400, msg=exc.message, retryable=True)
+            await self._reject_register(
+                writer,
+                code=400,
+                msg=exc.message,
+                retryable=True,
+                client_id=client_id,
+                peer=peer,
+            )
             return None
 
         try:
@@ -415,15 +429,31 @@ class TunnelServer:
             # 令牌表的热重载就在它内部的第一步，所以"改文件 → 下一次注册尝试即生效"。
             identity = self._auth.verify(msg, peer)
         except AuthError as exc:
-            self._log.warning("拒绝客户端 %s（%s）：%s", client_id, peer, exc)
-            await self._reject_register(writer, code=exc.code, msg=exc.message, retryable=exc.retryable)
+            # 此处**没有** identity 可用：verify 抛错意味着身份从未确立。
+            # 事件里 identity 留空，订阅方（管理台）要按"缺身份"渲染，
+            # 不能套用 ANONYMOUS —— 那会把"冒充/令牌失效"显示成"匿名用户"。
+            await self._reject_register(
+                writer,
+                code=exc.code,
+                msg=exc.message,
+                retryable=exc.retryable,
+                client_id=client_id,
+                peer=peer,
+            )
             return None
 
         if not self._registry.has(client_id) and self._registry.client_count >= self._config.limits.max_clients:
             reason = f"在线客户端数已达上限 {self._config.limits.max_clients}"
-            self._log.warning("拒绝客户端 %s：%s", client_id, reason)
             # 503＝"服务端没位置了"，回头可能就好 → 可重试
-            await self._reject_register(writer, code=503, msg=reason, retryable=True)
+            await self._reject_register(
+                writer,
+                code=503,
+                msg=reason,
+                retryable=True,
+                client_id=client_id,
+                peer=peer,
+                identity=identity.name,
+            )
             return None
 
         # 端口授权：刻意放在容量判定**之后**、登记会话**之前**。
@@ -438,8 +468,15 @@ class TunnelServer:
                 f"端口未授权：{unauthorized}（身份 {identity.name} 允许的内网端口："
                 f"{identity.ports or '不限'}）"
             )
-            self._log.warning("拒绝客户端 %s（%s）：%s", client_id, peer, reason)
-            await self._reject_register(writer, code=403, msg=reason, retryable=True)
+            await self._reject_register(
+                writer,
+                code=403,
+                msg=reason,
+                retryable=True,
+                client_id=client_id,
+                peer=peer,
+                identity=identity.name,
+            )
             return None
 
         # ⚠️ 注册消息里带着**令牌明文**，绝不能原样存进会话（MEMORY 不变量 1）。
@@ -517,15 +554,54 @@ class TunnelServer:
         code: int,
         msg: str,
         retryable: bool,
+        client_id: Optional[str] = None,
+        peer: Optional[str] = None,
+        identity: Optional[str] = None,
     ) -> None:
-        """回一条"注册被拒"的 ``register_ack``，并记账。
+        """回一条"注册被拒"的 ``register_ack``，并记账 + 记日志 + 发事件。
 
         ``retryable`` 是 ``403`` 的细分（见 :class:`RegistrationError`）：
         ``400``（客户端参数错）、``503``（容量满）与"端口未授权"都是**暂时**失败，
         客户端应当继续退避重试；只有"令牌无效 / 被吊销 / ``client_id`` 冒充"是**永久**失败。
         集中在这里生成回执，就不会出现"某个分支忘了带 retryable"的静默退化。
+
+        **日志与事件也在这一个点上做**，三个理由：
+
+        * 调用方各自 ``self._log.warning`` 时，``400`` 两条分支（client_id 非法、
+          local_ports 非法）**根本没有日志**——那正是最需要看到的一类拒绝
+          （配置写错了，运维只看得到"客户端一直上不了线"）。
+        * 五条分支的文案会各自漂移，事件载荷却必须是同一套键。
+        * 每次拒绝「一条 WARNING + 一个事件 + 一个计数」一一对应，管理台看到的
+          与 stderr 里翻到的是同一批事实。
+
+        ``client_id`` / ``peer`` / ``identity`` 允许缺省：
+
+        * ``identity`` 在**鉴权失败**时必然为空——``verify`` 抛错意味着身份从未确立，
+          这里给空串而不是 ``anonymous``，否则"冒充/令牌失效"会被渲染成"匿名用户"。
+        * ``client_id`` 在 ``400``（非法 client_id）时给 ``None``：那个值未经校验、
+          长度上限是 ``max_msg_len``（10MB），落进日志等于给对手一个日志放大器。
         """
         self._stats.registrations_rejected += 1
+        self._log.warning(
+            "拒绝注册：%s 来自 %s → [%s] %s（retryable=%s，身份 %s）",
+            client_id or "(未提供)",
+            peer or "未知来源",
+            code,
+            msg,
+            retryable,
+            identity or "未确立",
+        )
+        # 事件里固定给出全部键（空串而非缺键）：订阅方少一层 ``if "x" in payload``，
+        # 也不会出现"某个分支少发一个键"的静默差异。与 MAPPING_REJECTED 同一风格。
+        self._events.emit(
+            EventType.REGISTRATION_REJECTED,
+            code=code,
+            retryable=retryable,
+            msg=msg,
+            client_id=client_id or "",
+            peer=peer or "",
+            identity=identity or "",
+        )
         await self._send_raw(
             writer,
             make_msg(

@@ -41,6 +41,7 @@ SERVER_SUBSCRIPTIONS = (
     EventType.CLIENT_DISCONNECTED,
     EventType.CONN_ERROR,
     EventType.MAPPING_REJECTED,
+    EventType.REGISTRATION_REJECTED,
 )
 """转发给管理台的事件白名单。
 
@@ -50,7 +51,12 @@ SERVER_SUBSCRIPTIONS = (
 真正的计数已经由 ``snapshot()`` 覆盖。
 
 ``MAPPING_REJECTED`` 属于**安全事件**：它罕见、且运维必须看见
-（"某个身份一直改不动映射表"要能一眼定位到是权限没给，而不是界面上瞎猜）。"""
+（"某个身份一直改不动映射表"要能一眼定位到是权限没给，而不是界面上瞎猜）。
+
+``REGISTRATION_REJECTED`` 同理，但它是**运维排障的主力**：状态栏那个
+"被拒 N"只回答"拒了几次"，回答不了"谁被拒、为什么"——客户端表现为
+"一直连不上、日志里只有重连"，而原因（令牌失效 / 端口未授权 / 容量满 /
+参数写错）全在这条事件里。拒绝本身不频繁（客户端有退避），不会刷屏。"""
 
 
 class ServerController:

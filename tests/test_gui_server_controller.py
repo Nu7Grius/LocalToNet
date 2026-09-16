@@ -263,6 +263,74 @@ def test_admin_sees_mapping_rejection_event(run_async) -> None:
     run_async(scenario)
 
 
+def test_admin_sees_registration_rejection_event(run_async) -> None:
+    """注册被拒时管理台**必须**看到那行日志（转发白名单 + 渲染两头都要通）。
+
+    与 ``test_admin_sees_mapping_rejection_event`` 是同一类接缝的第二次钉：新增服务端事件
+    只改 `SERVER_SUBSCRIPTIONS` 或只改 `_SERVER_EVENT_HANDLERS`，都会表现成
+    "服务端日志正常、界面上什么都没有"——静默丢失比报错难查得多。
+
+    这里造一个**真实**的注册被拒（容量上限 1，再挂第二个客户端），而不是手工 emit：
+    手工 emit 只能证明"界面会渲染"，证明不了"服务端真的会发这个事件"。
+    """
+
+    async def scenario() -> None:
+        backend = DemoBackend("127.0.0.1", 0)
+        backend_port = await backend.start()
+        ports = free_ports(3)
+        config = build_server_config(backend_port=backend_port, ports=tuple(ports))
+        config.limits.max_clients = 1  # 只留一个位子：第一个在线，第二个必被 503 拒
+        config.validate()
+
+        with admin_runtime(config) as (loop_thread, bridge, controller):
+            vm = ServerViewModel(idle_timeout=config.timeouts.client_idle_timeout)
+            await await_thread(loop_thread.submit(controller.start()))
+            await pump_until(vm, bridge, lambda: vm.state.listening, what="管理台收到启动快照")
+
+            first = TunnelClient(
+                build_client_config(
+                    ports=(ports[0], ports[1]), backend_port=backend_port, client_id="admin-c1"
+                )
+            )
+            first_task = asyncio.create_task(first.run(), name="admin-test-client-c1")
+            try:
+                await wait_client_online(first, controller.snapshot)
+
+                # 第二个客户端：容量满 → 服务端发 REGISTRATION_REJECTED(503)
+                second = TunnelClient(
+                    build_client_config(
+                        ports=(ports[0], ports[1]),
+                        backend_port=backend_port,
+                        client_id="over-capacity",
+                    )
+                )
+                second_task = asyncio.create_task(second.run(), name="admin-test-client-over")
+                try:
+                    await pump_until(
+                        vm,
+                        bridge,
+                        lambda: any("注册被拒" in entry.text for entry in vm.state.log),
+                        what="注册被拒事件穿过转发白名单到达管理台",
+                    )
+                    entry = next(e for e in vm.state.log if "注册被拒" in e.text)
+                    assert "over-capacity" in entry.text
+                    assert "503" in entry.text
+                    assert "继续重试" in entry.text
+                    assert "over-capacity" in (vm.state.notice or "")
+                finally:
+                    await second.stop()
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(second_task, timeout=5)
+            finally:
+                await first.stop()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(first_task, timeout=5)
+
+        await backend.stop()
+
+    run_async(scenario)
+
+
 def test_admin_mapping_change_reaches_every_client(run_async) -> None:
     """管理台提交映射后：新端口立即可用，**且在线客户端的映射表跟着变**。
 

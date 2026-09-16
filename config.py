@@ -286,13 +286,20 @@ class AuthConfig:
 
     ``file`` 给出时以**文件为权威**、``token`` 只当首次种子（与 ``mapping_store`` 同一先例）。
     令牌表刻意**不内联进** ``config.json``：令牌是机密，而配置文件常被提交进仓库或贴进文档。
+
+    ``shared_can_manage_mapping`` **只对共享令牌模式有意义**（``token`` 那条路）：
+    令牌表的写权限是**逐条目**的 ``can_manage_mapping``，与此开关无关。
+    默认 ``True`` ＝保持鉴权一期行为不变（升级不改变任何现有部署的能力）；
+    置 ``false`` 就把"共享令牌持有者改映射表"这条也收掉——共享令牌分不出"谁是谁"，
+    想按人授权请改用令牌表；但"一刀切全禁"在只有一把钥匙的部署里仍然是有效选择。
     """
 
     enabled: bool = False
     token: str = ""
     file: str = ""
+    shared_can_manage_mapping: bool = True
 
-    _FIELDS = ("enabled", "token", "file")
+    _FIELDS = ("enabled", "token", "file", "shared_can_manage_mapping")
 
     @classmethod
     def from_dict(cls, data: Optional[Mapping[str, Any]]) -> "AuthConfig":
@@ -303,6 +310,9 @@ class AuthConfig:
             enabled=_as_bool(data.get("enabled", False), "auth.enabled"),
             token=_as_str(data.get("token", ""), "auth.token"),
             file=_as_str(data.get("file", ""), "auth.file"),
+            shared_can_manage_mapping=_as_bool(
+                data.get("shared_can_manage_mapping", True), "auth.shared_can_manage_mapping"
+            ),
         )
 
     def validate(self) -> None:
@@ -666,6 +676,14 @@ class ServerConfig:
         if "auth_file" in env:
             cfg.auth.file = env["auth_file"]
             cfg.auth.enabled = True
+        # 共享令牌的映射表写权限。默认 True（与 AuthConfig 的字段默认一致），
+        # 显式给 false 才收紧；环境变量是字符串，必须过 _as_env_bool
+        # （`LOCALTONET_AUTH_SHARED_CAN_MANAGE_MAPPING=false` 若当真值会**放开**权限）。
+        if "auth_shared_can_manage_mapping" in env:
+            cfg.auth.shared_can_manage_mapping = _as_env_bool(
+                env["auth_shared_can_manage_mapping"],
+                "LOCALTONET_AUTH_SHARED_CAN_MANAGE_MAPPING",
+            )
         if "mapping_store" in env:
             cfg.mapping_store.type = env["mapping_store"].strip().lower()
         if "mapping_store_path" in env:

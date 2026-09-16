@@ -26,6 +26,11 @@
 - **明确的 `403` 细分**：令牌无效＝永久失败（客户端停手），端口未授权＝可重试（改完令牌表自动上车）
 - **映射表写权限收口**：改全局映射表要**逐身份**授权（`tokens[].can_manage_mapping`，**默认关闭**）；
   被拒时回执带 `code: 403`、服务端发 `MAPPING_REJECTED` 事件，管理台能看到是谁被拒了
+- **共享令牌的写权限也可关**：`auth.shared_can_manage_mapping: false`（默认 `true`，不动现有部署）
+  把"共享令牌持有者改映射表"这条一起收掉——一把钥匙分不出人，做不到按人授权，但能做到一刀切
+- **注册被拒可观测**：五个拒绝分支（`400`×2 / `403` 鉴权 / `503` 容量 / `403` 端口未授权）共用一个
+  `REGISTRATION_REJECTED` 事件，载荷带 `code` / `retryable` / `msg` / `client_id` / `peer` / `identity`，
+  管理台日志面板直接写下"谁被拒、什么原因、客户端会不会继续重试"
 - **带宽限流**：按客户端、按方向（上行/下行）独立限速，令牌桶平滑而非"每秒硬切"
 - **并发配额**：限制单客户端同时在途的转发数，超了直接回 `429`，不排队、不拖垮服务端
 - **映射持久化**：`--mapping-store file` 把映射表落到 JSON，重启服务端不再回到配置文件的状态
@@ -109,7 +114,7 @@ python client.py --server 1.2.3.4:7000 --local-ports 8000,8080 --client-id my-pc
 
 | 方式 | 适用 | 特点 |
 | --- | --- | --- |
-| 共享令牌 `auth.token` | 本地演示、整个内网就是一个信任域 | 一个口令，谁拿到都能认领任意端口、也能改服务端映射表；换令牌要重启 |
+| 共享令牌 `auth.token` | 本地演示、整个内网就是一个信任域 | 一个口令，谁拿到都能认领任意端口、也能改服务端映射表（可用 `auth.shared_can_manage_mapping: false` 整体关掉）；换令牌要重启 |
 | 令牌表 `auth.file` | 生产 | 每个令牌带**身份**、**允许认领的内网端口**与**映射表写权限**；改文件即生效，不必重启 |
 
 两者**互斥**：同时给出会被 `auth.validate()` 拦下、以退出码 `2` 结束——只允许一个凭据来源，
@@ -128,6 +133,12 @@ python client.py --server 1.2.3.4:7000 --local-ports 8000,8080 --client-id my-pc
 
 给 `--auth-file` / `LOCALTONET_AUTH_FILE` / `auth.file` 任一即**隐式开启**鉴权
 （与 `--mapping-store-path` 隐式切 `file` 同理）。
+
+> `auth.shared_can_manage_mapping` 只有 **JSON 与环境变量**两条路
+> （`LOCALTONET_AUTH_SHARED_CAN_MANAGE_MAPPING`，接受 `1/true/yes/on` 与 `0/false/no/off`），
+> **没有命令行开关**——同 `limits` 与 `mapping[].tls` 的先例：CLI 只承担"常用路径 +
+> 逃生门"，这个开关默认值就保持现状，只在明确要收紧时才写。默认 `true`，
+> 写非布尔值（`"true"` 字符串、`0`）一律**报错**，不做隐式转换。
 
 命令行优先级最高，所以它是**切换凭据来源**的完整动作：`--auth-file` 会清掉配置里的 `auth.token`，
 `--token` 会清掉 `auth.file`。否则"JSON 里配了 token、命令行给了 file"会撞上互斥校验，
@@ -192,11 +203,15 @@ python client.py --server 1.2.3.4:7000 --local-ports 8000,8080 --client-id my-pc
 | 部署方式 | 谁能改映射表 |
 | --- | --- |
 | 不校验（`auth.enabled=false` / `--no-auth`） | 所有人（没有身份概念，也就无从授权） |
-| 共享令牌 `auth.token` | 所有持令牌者（一把钥匙分不出"谁"） |
+| 共享令牌 `auth.token` | 默认所有持令牌者；`auth.shared_can_manage_mapping: false` → 没有人 |
 | 令牌表 `auth.file` | 只有写了 `can_manage_mapping: true` 的条目 |
 
 - **省略＝不可以**（fail closed）。`0` / `"true"` 这类写法会直接**报错**，不做隐式转换——
   权限字段最怕"我以为开了、其实没开"。
+- 共享令牌那条路**反方向**：它默认**放行**，因为一期的行为就是这样，升级不该悄悄改掉现有部署的能力。
+  想收掉就显式写 `false`——这把钥匙分不出"谁是谁"，所以只能整体开关；
+  要**按人**授权请换令牌表，那里是逐条目的 `can_manage_mapping`。
+  这个开关**不渗进令牌表那条路**（否则会出现"配置说不能、文件说能"的叠加态，没人知道该信哪个）。
 - 判定发生在**注册**，结果快照进会话，`set_mapping` 只读那个布尔值：
   改令牌表后需要该客户端**重连**才生效。这与"已建立的连接不因令牌轮换而断开"是同一条语义
   （注册成功后令牌已被抹掉，会话里再没有可回查的凭据）。
@@ -236,11 +251,25 @@ python client.py --server 1.2.3.4:7000 --local-ports 8000,8080 --client-id my-pc
 > ⚠️ 不要把 `403` 整类改成可重试，也不要用 `409` 表达"未授权"：`409` 已被"端口被别的客户端占了"
 > 占用，`429` / `503` 也各有明确语义（`429`＝"你的额度用完了"、`503`＝"整机满了"），**四者不可统一**。
 
+**上表五行都发同一个进程内事件 `REGISTRATION_REJECTED`**，载荷固定带
+`code` / `retryable` / `msg` / `client_id` / `peer` / `identity`：
+
+- **不按 `code` 拆成多个事件名**：`register_ack` 里已经用 `code` + `retryable` 表达了完整语义，
+  事件再拆一套等价枚举就会出现"两处名表各自生长、漏改一处"的接缝
+  （而事件白名单本来就有两处要同步改，见下）。订阅方要分类，读 `code` 即可。
+- **鉴权失败时 `identity` 为空串**，不是 `anonymous`：`verify` 抛错意味着身份从未确立，
+  写成匿名会把"令牌失效 / 冒充"显示成"匿名用户"，指错排查方向。
+- **不做去重 / 限频**：拒绝是 WARNING 级罕见事件，客户端也有自己的退避间隔，
+  而"某台机器一直上不了线"正是要靠**每一次**留痕来定位。累计次数另有
+  `stats.registrations_rejected`（管理台状态栏已在显示）。
+- 每次拒绝对应**一条 WARNING 日志**（收在 `_reject_register` 单点生成，文案不会各分支漂移）。
+  这也是本轮顺带补的缺口：`400` 那两条分支此前**连日志都没有**。
+
 ### 忘了配客户端令牌会怎样
 
 症状很明确，不会含糊成"连不上，原因不明"：
 
-1. 服务端日志 `拒绝客户端 test-xxx（127.0.0.1:xxxxx）：客户端 … 提供的令牌不在令牌表中`；
+1. 服务端日志 `拒绝注册：test-xxx 来自 127.0.0.1:xxxxx → [403] 客户端 … 提供的令牌不在令牌表中（retryable=False，身份 未确立）`；
 2. 客户端收到 `403, retryable=false`，状态变 `stopped` 并**停止重试**，日志写
    `注册被永久拒绝（[403] …），停止重试`，事件总线发一条 `CONTROL_LOST(fatal=True)`
    （GUI 的事件日志里能看到）。
@@ -536,7 +565,7 @@ LocalToNet/
 │       ├── app.py            客户端窗口
 │       └── server_app.py     管理台窗口（在线客户端表 + 映射表）
 ├── examples/demo_backend.py  演示用内网 HTTP 服务
-└── tests/                    385 项测试（单测 + 端到端 + 双端 GUI + 命令行 + 鉴权 + TLS + 访客端 TLS）
+└── tests/                    406 项测试（单测 + 端到端 + 双端 GUI + 命令行 + 鉴权 + TLS + 访客端 TLS）
 ```
 
 ## 协议
@@ -699,7 +728,7 @@ python server_gui.py --no-autostart                 # 只开窗口，先看配�
 | 在线客户端（只读） | 身份、客户端 ID、对端地址、认领的内网端口、在线时长、空闲时长；空闲达到看门狗阈值会标「将失联」 |
 | 映射表（可编辑） | 与客户端界面同一套增删改查与三态「访客 TLS」；提交后立即起停访客端口，**并广播给所有在线客户端** |
 | 状态栏 | 服务端名、鉴权模式、在线数、监听端口、挂起通道、注册/被拒计数、请求与失败计数、上下行字节、限速累计等待 |
-| 事件日志 | 启动/停止、客户端上线下线（含身份）、转发失败原因、**映射表改动被拒（谁被拒、为什么）**；请求完成刻意不记，见下 |
+| 事件日志 | 启动/停止、客户端上线下线（含身份）、转发失败原因、**映射表改动被拒（谁被拒、为什么）**、**注册被拒（谁、什么码、什么原因、会不会继续重试）**；请求完成刻意不记，见下 |
 
 三个值得说明的设计：
 
@@ -756,7 +785,7 @@ App ──root.after(100ms)──► drain()  ◄── queue ◄── EventBus
 | 超时参数 | `config.Timeouts` | 集中默认值 | 环境变量 / 运行时可调 |
 
 事件总线已预留 `REQUEST_START` / `REQUEST_END` / `CONN_ERROR` / `MAPPING_CHANGED` /
-`MAPPING_REJECTED` 等事件，
+`MAPPING_REJECTED` / `REGISTRATION_REJECTED` 等事件，
 两端界面都已挂上去（见 `localtonet/gui/controller.py` 与 `localtonet/gui/server_controller.py`
 的订阅白名单），加指标系统同理，核心链路无需改动。
 客户端 `TunnelClient.set_mapping()` 封装了"提交映射并等待回执"的语义、服务端
@@ -769,10 +798,10 @@ python -m pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-当前 **385 项全部通过**（test_config 63 / test_gui_model 50 / test_auth_tokens 44 / test_core 40 /
-test_server_cli 29 / test_gui_server_model 31 / test_e2e 21 / test_mapping_store 21 /
-test_protocol 17 / test_visitor_tls 13 / test_limiter 12 / test_gui_bridge 10 /
-test_gui_server_controller 11 / test_tls 10 / test_client_cli 7 / test_gui_controller 6），
+当前 **406 项全部通过**（test_config 69 / test_auth_tokens 54 / test_gui_model 50 / test_core 40 /
+test_gui_server_model 35 / test_server_cli 29 / test_mapping_store 21 / test_e2e 21 /
+test_protocol 17 / test_visitor_tls 13 / test_limiter 12 / test_gui_server_controller 12 /
+test_tls 10 / test_gui_bridge 10 / test_client_cli 7 / test_gui_controller 6），
 其中 21 项是真实拉起三件套、走真实 TCP 的端到端测试：
 
 | 用例 | 验证内容 |
@@ -784,7 +813,7 @@ test_gui_server_controller 11 / test_tls 10 / test_client_cli 7 / test_gui_contr
 | 无在线客户端 | `502 No client online` |
 | 客户端掉线 | `502`，端口归属被释放 |
 | 后端未启动 | `conn_error` 上报 + 502 带真实原因 |
-| 端口独占 | 第二个客户端被拒，老客户端不受影响 |
+| 端口独占 | 第二个客户端被拒，老客户端不受影响（等待条件同时覆盖服务端登记**与**客户端处理完 `register_ack`——只等服务端会在回执到达前读出空列表，见下） |
 | 动态映射 | 加端口立即可用、删端口立即失效 |
 | 无映射规则 | `404`（竞态窗口分支） |
 | 未映射端口 | 根本不监听，连接直接被拒 |
@@ -818,7 +847,7 @@ TLS 访客打明文端口都必须拿不到数据，否则"配置里多了几个
 **热切换**（切 `tls` 时 `diff.changed` 有它、监听重建、握手协议真的换了；缺证书的更新必须在
 停监听**之前**被拒，端口仍能正常服务）。
 
-`tests/test_auth_tokens.py`（44 项）是鉴权二期的主战场，全部走真实三件套，守六条线：
+`tests/test_auth_tokens.py`（54 项）是鉴权二期的主战场，全部走真实三件套，守八条线：
 **兼容**（不配 `auth.file` 时单令牌路径一字不差，旧类名 `TokenAuthenticator` 仍是同一对象）；
 **授权**（白名单内可认领、`ports: []` ＝不限、`client_id` 绑定通过/冒充被拒、
 声明未授权端口 → **整体拒绝**且连授权过的那个端口也没被认领、随后能被别的客户端干净拿走）；
@@ -832,12 +861,23 @@ TLS 访客打明文端口都必须拿不到数据，否则"配置里多了几个
 **映射表写权限**（省略字段＝改不动，且**映射表与监听端口一个字都没变**、新端口连不上——
 不止"回执说了 ok=false"；`can_manage_mapping: true` 才改得动且新端口**真的能通**；
 `0` / `1` / `"true"` 一律报错不做隐式转换；权限在**注册时快照**，改令牌表不影响已建立会话、
-**重连**才生效；共享令牌与 `--no-auth` 保持一期行为；管理台 `submit_mapping` **豁免**）。
+**重连**才生效；共享令牌与 `--no-auth` 保持一期行为；管理台 `submit_mapping` **豁免**）；
+**共享令牌的写权限开关**（默认 `true` 时行为与一期一字不差；`false` 才收紧，且收紧后
+会话快照为 `false`、`set_mapping` 回 403、**映射表一个字都没变**；这个全局开关
+**不渗进令牌表那条路**——把两者叠起来就会出现"配置说不能、文件说能"的说不清的态）；
+**注册被拒可观测**（五个拒绝分支共用 `REGISTRATION_REJECTED`，载荷键固定；
+**鉴权失败时 `identity` 为空串**而不是 `anonymous`；成功注册**一条都不发**——负命题要有对照）。
 
 `tests/test_gui_server_model.py` / `test_gui_server_controller.py` 里另有两处配合：
-后者专门断言 `MAPPING_REJECTED` **真的穿过事件白名单**到达管理台日志面板——
+后者专门断言 `MAPPING_REJECTED` 与 `REGISTRATION_REJECTED` **真的穿过事件白名单**到达管理台日志面板
+（后者造的是**真实**拒绝：容量上限 1 再挂第二个客户端，手工 `emit` 只能证明"界面会渲染"，
+证明不了"服务端真的会发"）——
 `SERVER_SUBSCRIPTIONS` 少登记一个事件时，服务端日志一切正常、界面上却什么都没有，
 静默丢失比报错难查得多。
+
+> **安全开关类改动都做过变异验证**（证明用例不是恒真）：本轮四组——拆掉共享令牌的写权限判定 → 2 红；
+> 默认值翻成收紧 → 4 红；摘掉事件转发白名单 → 1 红；鉴权失败时把 `identity` 写成 `anonymous` → 1 红。
+> 四期另有四组（拆权限判定 / 摘白名单 / 默认值翻允许 / 共享令牌收紧），做法见 commit 记录。
 
 `tests/test_limiter.py` 用假时钟（记录每次 sleep 的时长）断言令牌桶**真的在等**而不是空转：
 初始桶是满的、请求大于桶容量时被拆分且总量守恒、`rate <= 0` 被拒、禁用时不创建任何桶。
@@ -880,8 +920,10 @@ GUI 相关的五组测试（`test_gui_model` / `test_gui_bridge` / `test_gui_con
 - **两个界面改的都是服务端的映射表**；客户端"认领哪些本机端口"仍来自启动配置
   （协议里没有运行期修改认领端口的指令，要支持得先扩展协议）
 - **任何在线客户端都能改服务端映射表** —— 已在令牌表模式下收口（默认关闭，见
-  「映射表写权限：`can_manage_mapping`」）。**残留缺口**：不校验与共享令牌这两种部署里
-  仍然人人可改，因为它们分不出"谁是谁"，也没有可挂授权的身份；要按人收口必须用令牌表
+  「映射表写权限：`can_manage_mapping`」）。**残留缺口**：不校验部署里仍然人人可改
+  （没有身份概念，无从授权）；共享令牌部署里**只能整体开关**
+  （`auth.shared_can_manage_mapping: false` 把所有人一起关掉，或保持默认的全体放行），
+  做不到"某把钥匙能改、另一把不能"——一把钥匙分不出"谁是谁"。**要按人收口必须用令牌表**
 - 映射表写权限是**逐身份**的布尔开关，**没有**更细的粒度：不能表达"只能改某几个公网端口"，
   也没有"只读的管理员"。真有这种需求得把映射表按端口分域，属于权限模型的下一步
 - 图形界面需要 tkinter（CPython 标准库，不算第三方依赖）；
@@ -889,9 +931,6 @@ GUI 相关的五组测试（`test_gui_model` / `test_gui_bridge` / `test_gui_con
 - **管理台是本机同进程的，不做远程管理**：它读的是 `TunnelServer` 对象、
   调的是进程内方法，没有新增任何指令。也因此**关掉管理台窗口 = 服务端下线**
   （访客端口全部关闭）；要长期托管请用 `server.py`
-- 管理台**看不到"哪次注册被拒、为什么"**：注册被拒只累加 `stats.registrations_rejected`，
-  没有对应事件（服务端 stderr 里有 WARNING 日志）。注意这不包括**映射表写权限被拒**——
-  那个已经有 `MAPPING_REJECTED` 事件与 `stats.mapping_rejected` 计数了
 - 管理台的在线客户端表**只读**，不做踢人：映射表写权限只回答了"能不能改映射"，
   没有回答"能不能断开别人"，而一个误点的按钮就能掐断正在服务的隧道
 - 管理台**每 0.5 秒采样一次**状态，所以界面上的在线数与字节数最多滞后一个采样周期；

@@ -296,6 +296,88 @@ def test_mapping_rejected_event_survives_missing_fields() -> None:
     assert ANONYMOUS_IDENTITY in state.log[-1].text
 
 
+# --------------------------------------------------------------------------- #
+# REGISTRATION_REJECTED：把状态栏那个"被拒 N"变成可读的一行
+# --------------------------------------------------------------------------- #
+#
+# 状态栏只回答"拒了几次"，回答不了"谁被拒、为什么"。日志行必须能**独立读懂**：
+# 谁（有身份就带身份）、从哪来、什么码、什么原因、以及客户端接下来会不会继续重试。
+
+
+def test_registration_rejected_renders_identity_client_and_reason() -> None:
+    state = apply_server_event(
+        ServerState(),
+        EventType.REGISTRATION_REJECTED,
+        code=403,
+        retryable=True,
+        msg="端口未授权：[8000]（身份 alice 允许的内网端口：[9000]）",
+        client_id="alice-1",
+        peer="10.0.0.9:5001",
+        identity="alice",
+    )
+    assert len(state.log) == 1
+    text = state.log[-1].text
+    assert "alice" in text and "alice-1" in text and "10.0.0.9:5001" in text
+    assert "403" in text and "端口未授权" in text
+    # 可重试＝客户端自己会退避重试：不该用 warn 吓人（严重度区分是有意义的）
+    assert state.log[-1].level == "info"
+    assert "继续重试" in text
+    assert "alice" in (state.notice or "")
+
+
+def test_registration_rejected_permanent_failure_is_a_warning() -> None:
+    """永久失败（令牌不对／冒充）要人工介入，必须是 warn 级，且写明客户端已停手。"""
+    state = apply_server_event(
+        ServerState(),
+        EventType.REGISTRATION_REJECTED,
+        code=403,
+        retryable=False,
+        msg="客户端 127.0.0.1:5 提供的 token 不合法",
+        client_id="c-1",
+        peer="127.0.0.1:5",
+        identity="",
+    )
+    assert state.log[-1].level == "warn"
+    assert "已停止重试" in state.log[-1].text
+
+
+def test_registration_rejected_without_identity_does_not_say_anonymous() -> None:
+    """鉴权失败时身份**从未确立**，界面不许把它渲染成"匿名用户"。
+
+    这一条盯的是最容易犯的错：照抄 ``_on_mapping_rejected`` 的
+    ``payload.get("identity") or ANONYMOUS_IDENTITY`` —— 那会把
+    "令牌失效 / 冒充" 显示成 "anonymous 没有权限"，指错排查方向。
+    """
+    state = apply_server_event(
+        ServerState(),
+        EventType.REGISTRATION_REJECTED,
+        code=403,
+        retryable=False,
+        msg="令牌不在令牌表中",
+        client_id="c-2",
+        peer="127.0.0.1:6",
+        identity="",
+    )
+    text = state.log[-1].text
+    assert "c-2" in text
+    assert ANONYMOUS_IDENTITY not in text
+    assert ANONYMOUS_IDENTITY not in (state.notice or "")
+
+
+def test_registration_rejected_event_survives_missing_fields() -> None:
+    """老版本服务端 / 载荷被裁剪时只该退化，不该把界面搞崩。
+
+    缺 ``retryable`` 按"不可重试"渲染（warn）：宁可多标一次黄，
+    也不要让"客户端已停止重试"这种要人动手的状态被静默成 info。
+    """
+    state = apply_server_event(ServerState(), EventType.REGISTRATION_REJECTED)
+    assert len(state.log) == 1
+    assert state.log[-1].level == "warn"
+    text = state.log[-1].text
+    assert "注册被拒" in text and "[?]" in text and "未知原因" in text
+    assert ANONYMOUS_IDENTITY not in text
+
+
 def test_request_end_produces_no_log_on_purpose() -> None:
     """服务端的 REQUEST_END **没有**成功标志字段，写不出有信息量的日志。
 

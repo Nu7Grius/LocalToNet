@@ -17,6 +17,11 @@ tests/test_auth_tokens.py —— 鉴权二期：令牌表 + 按内网端口授�
    令牌明文**一次都不出现**在日志、事件与 ``ClientSession.register_msg`` 里。
 5. **时序侧信道**：令牌比较必须走完全部条目（含被吊销的），用假比较函数数调用次数来钉。
 6. **映射表写权限**：默认关闭（fail closed）、逐条目授权、注册时快照进会话、管理台豁免。
+7. **共享令牌的写权限开关**：`auth.shared_can_manage_mapping` 默认 true（不动现有部署），
+   显式 false 才收紧；且这个全局开关**不渗进令牌表那条路**（那条是逐条目授权）。
+8. **注册被拒可观测**：五个拒绝分支共用一个 `REGISTRATION_REJECTED` 事件，
+   载荷带 code/retryable/msg/client_id/peer/identity；**鉴权失败时 identity 为空串**
+   （身份未确立，写成 anonymous 会把"令牌失效"显示成"匿名用户"）；成功注册不发事件。
 
 全程用 ``tests.helpers.TunnelHarness`` 拉真实三件套走真实 TCP，不 mock。
 注册注定失败的用例一律 ``expect_online=False``，断言一律"轮询到达条件 + 死线"，
@@ -50,7 +55,8 @@ from localtonet.server.auth import (
 )
 from localtonet.server.core import TunnelServer
 from localtonet.server.tokenstore import TokenStore, compare_secret
-from tests.helpers import TunnelHarness, free_ports, http_request
+from protocol import MsgType, recv_msg, send_msg
+from tests.helpers import TunnelHarness, close_quietly, free_ports, http_request
 
 ALICE = "alice-token-1a2b"
 BOB = "bob-token-3c4d"
@@ -1133,3 +1139,337 @@ def test_management_console_bypasses_mapping_permission(tmp_path: Path) -> None:
             assert server.stats.mapping_rejected == 0
 
     asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------- #
+# 共享令牌的写权限开关（`auth.shared_can_manage_mapping`，本轮搭车项）
+# --------------------------------------------------------------------------- #
+#
+# 四期把写权限按**令牌表条目**收口了，但共享令牌那条路一直是硬编码 `True`：
+# 一把钥匙分不出人，也就无从按人授权，于是"共享令牌持有者能不能改映射表"
+# 只能整体开关。默认 **True**（＝升级不改变任何现有部署的能力），显式 false 才收紧。
+#
+# 三条验收线：
+#   1. 关掉之后**真的**改不动（会话快照 + 回执 + 计数 + 映射表零变化）。
+#   2. 默认仍放行（证伪"一刀切收紧"）。
+#   3. 这个全局开关**不渗进令牌表那条路**（那条是逐条目授权，语义不同，叠加会变成
+#      "配置说能、文件说不能"的说不清的态）。
+
+
+def test_build_authenticator_honours_shared_mapping_switch() -> None:
+    """解析层：开关真的接到校验器上，而不是只在配置对象上躺着。"""
+    open_cfg = AuthConfig(enabled=True, token="shared-x")
+    shut_cfg = AuthConfig(enabled=True, token="shared-x", shared_can_manage_mapping=False)
+
+    assert build_authenticator(open_cfg).verify({"token": "shared-x"}, "p").can_manage_mapping is True
+    assert (
+        build_authenticator(shut_cfg).verify({"token": "shared-x"}, "p").can_manage_mapping is False
+    )
+
+
+def test_shared_mapping_switch_is_visible_in_name_and_snapshot() -> None:
+    """收紧必须**看得见**：启动日志那行与 ``snapshot()["auth"]``（管理台状态栏）都要写出来。
+
+    这是"我配了但没生效"与"我忘了配"唯一能在界面/日志上区分开的地方——
+    默认放行的安全开关如果收紧失败还悄无声息，等于没做。
+    """
+    shut = build_authenticator(
+        AuthConfig(enabled=True, token="shared-x", shared_can_manage_mapping=False)
+    )
+    open_auth = build_authenticator(AuthConfig(enabled=True, token="shared-x"))
+
+    assert open_auth.name == "token"  # 与一期一字不差
+    assert shut.name == "token(映射表只读)"
+
+    async def scenario() -> None:
+        def server_cfg(config: ServerConfig) -> None:
+            config.auth.enabled = True
+            config.auth.token = "shared-x"
+            config.auth.shared_can_manage_mapping = False
+
+        async with TunnelHarness(
+            configure_server=server_cfg,
+            configure_client=token_client("shared-x"),
+        ) as harness:
+            assert harness.server is not None
+            # 管理台状态栏读的就是这个键
+            assert harness.server.snapshot()["auth"] == "token(映射表只读)"
+
+    asyncio.run(scenario())
+
+
+def test_shared_token_mapping_write_can_be_disabled_end_to_end() -> None:
+    """关掉开关后：会话快照是 False、回执 403、映射表**一个字都没变**。"""
+    def server_cfg(config: ServerConfig) -> None:
+        config.auth.enabled = True
+        config.auth.token = "legacy-shared"
+        config.auth.shared_can_manage_mapping = False
+
+    extra_port = free_ports(1)[0]
+
+    async def scenario() -> None:
+        async with TunnelHarness(
+            configure_server=server_cfg,
+            configure_client=token_client("legacy-shared"),
+        ) as harness:
+            assert harness.server is not None and harness.client is not None
+            server, client = harness.server, harness.client
+
+            session = server.registry.get(client.client_id)
+            assert session is not None
+            # 身份标签仍是 shared（令牌本身没错），但**写权限**被配置收掉了
+            assert session.identity == "shared"
+            assert session.can_manage_mapping is False
+            assert session.snapshot()["can_manage_mapping"] is False
+
+            before = [rule.to_dict() for rule in server.mapping.rules()]
+            result = await client.set_mapping(_rules_to_add(harness, extra_port))
+
+            assert result["ok"] is False
+            assert result["code"] == 403
+            assert [rule.to_dict() for rule in server.mapping.rules()] == before
+            with pytest.raises(OSError):
+                await http_request(extra_port, "/", timeout=3.0)
+
+            assert server.stats.mapping_rejected == 1
+            assert server.stats.registrations_rejected == 0  # 注册本身是成功的
+
+    asyncio.run(scenario())
+
+
+def test_shared_token_mapping_write_still_open_by_default() -> None:
+    """默认放行：不写这个字段时行为与一期一字不差（证伪"顺手就收紧了"）。
+
+    升级工程最怕的不是"没关"，而是"以为关了"或"没让它关它却关了"。
+    """
+
+    def server_cfg(config: ServerConfig) -> None:
+        config.auth.enabled = True
+        config.auth.token = "legacy-shared"
+
+    extra_port = free_ports(1)[0]
+
+    async def scenario() -> None:
+        async with TunnelHarness(
+            configure_server=server_cfg,
+            configure_client=token_client("legacy-shared"),
+        ) as harness:
+            assert harness.server is not None and harness.client is not None
+            session = harness.server.registry.get(harness.client.client_id)
+            assert session is not None and session.can_manage_mapping is True
+            assert (await harness.client.set_mapping(_rules_to_add(harness, extra_port)))["ok"] is True
+
+    asyncio.run(scenario())
+
+
+def test_shared_mapping_switch_does_not_leak_into_token_table(tmp_path: Path) -> None:
+    """令牌表那条路**不受**这个全局开关影响：写权限只由条目的 ``can_manage_mapping`` 决定。
+
+    把两者叠在一起就会出现"配置说不能、文件说能"的叠加态，排查时没人知道该信哪个。
+    这条用例把边界钉死：开关只在 ``config.token``（共享令牌）那条分支被读。
+    """
+    table = write_table(
+        tmp_path / "tokens.json",
+        {"name": "alice", "token": ALICE, "can_manage_mapping": True},
+    )
+
+    def server_cfg(config: ServerConfig) -> None:
+        config.auth.enabled = True
+        config.auth.file = str(table)
+        config.auth.shared_can_manage_mapping = False  # 对本条路**无意义**
+
+    extra_port = free_ports(1)[0]
+
+    async def scenario() -> None:
+        async with TunnelHarness(
+            configure_server=server_cfg,
+            configure_client=token_client(ALICE),
+        ) as harness:
+            assert harness.server is not None and harness.client is not None
+            session = harness.server.registry.get(harness.client.client_id)
+            assert session is not None and session.identity == "alice"
+            assert session.can_manage_mapping is True  # 条目说了算
+            assert (await harness.client.set_mapping(_rules_to_add(harness, extra_port)))["ok"] is True
+
+    asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------- #
+# 注册被拒事件（本轮新增）：把"哪一次、什么原因"补上
+# --------------------------------------------------------------------------- #
+#
+# 背景：``stats.registrations_rejected`` 只回答"拒了几次"（管理台状态栏已在显示），
+# 回答不了"谁被拒、为什么"——客户端侧的症状一律是"连不上、反复重连"，
+# 而原因（令牌失效 / 端口未授权 / 容量满 / 参数写错）此前只在服务端 stderr 里，
+# 且 ``400`` 两条分支**连日志都没有**。
+#
+# 四条验收线（每条都要能证伪）：
+#   1. 各拒绝分支都发**同一个**事件，载荷固定带 code / retryable / msg / client_id / peer / identity。
+#   2. **鉴权失败时 identity 为空串**：verify 抛错意味着身份从未确立，写成 anonymous
+#      会把"令牌失效/冒充"显示成"匿名用户"。
+#   3. 成功注册**一个事件都不发**（负命题要有对照，否则"发了"和"到处都发"分不清）。
+#   4. 事件次数与 ``stats.registrations_rejected`` 一一对应（两套账不能各算各的）。
+#
+# 订阅时机很关键：``async with TunnelHarness(...)`` 里客户端在 ``__aenter__`` 就已注册完，
+# 而**永久性**拒绝（403 鉴权）只发生一次 —— 进去再订阅必然漏掉。所以这些用例统一
+# ``start_client=False`` → 先订阅 → 再 ``await harness.start_client()``。
+
+
+def _subscribe_registration_rejections(harness: TunnelHarness) -> List[Dict[str, Any]]:
+    """订阅注册被拒事件。必须在客户端开始拨号**之前**调用。"""
+    assert harness.server is not None
+    rejects: List[Dict[str, Any]] = []
+    harness.server.events.on(
+        EventType.REGISTRATION_REJECTED, lambda **payload: rejects.append(payload)
+    )
+    return rejects
+
+
+def test_registration_rejected_event_on_permanent_auth_failure() -> None:
+    """令牌不对（永久失败）：事件必须有，且**不带身份**——这里 identity 还不存在。"""
+
+    def server_cfg(config: ServerConfig) -> None:
+        config.auth.enabled = True
+        config.auth.token = "the-real-one"
+
+    async def scenario() -> None:
+        async with TunnelHarness(
+            start_client=False,
+            configure_server=server_cfg,
+            configure_client=token_client("definitely-wrong"),
+        ) as harness:
+            assert harness.server is not None
+            rejects = _subscribe_registration_rejections(harness)
+            client = await harness.start_client()
+
+            await harness.wait_until(lambda: client.state == "stopped", what="客户端被永久拒绝后停手")
+
+            assert len(rejects) == 1, f"永久拒绝只发生一次，事件也该恰好一条：{rejects}"
+            event = rejects[0]
+            assert event["code"] == 403
+            assert event["retryable"] is False
+            assert event["identity"] == ""  # ← 关键：身份从未确立，不能是 anonymous
+            assert event["client_id"] == client.client_id
+            assert "127.0.0.1" in event["peer"]
+            assert "token" in event["msg"] or "令牌" in event["msg"]
+            assert harness.server.stats.registrations_rejected == 1
+
+    asyncio.run(scenario())
+
+
+def test_registration_rejected_event_carries_identity_when_known(tmp_path: Path) -> None:
+    """端口未授权（可重试 403）：身份**已经确立**，事件里必须带上它（含端口名）。"""
+    allowed, denied = free_ports(2)
+    table = write_table(
+        tmp_path / "tokens.json",
+        {"name": "alice", "token": ALICE, "ports": [allowed]},
+    )
+
+    async def scenario() -> None:
+        async with TunnelHarness(
+            start_client=False,
+            configure_server=auth_file_server(table),
+            configure_client=token_client(ALICE, ports=[allowed, denied]),
+        ) as harness:
+            assert harness.server is not None
+            rejects = _subscribe_registration_rejections(harness)
+            client = await harness.start_client()
+
+            # 可重试类：客户端会继续退避重试，所以这里等"至少来了一条"再复检
+            await harness.wait_until(lambda: len(rejects) >= 1, what="端口未授权事件到达")
+            assert client.state != "stopped"
+            first = rejects[0]
+            assert first["code"] == 403
+            assert first["retryable"] is True
+            assert first["identity"] == "alice"  # ← 与鉴权失败那条的差别就在这里
+            assert first["client_id"] == client.client_id
+            assert str(denied) in first["msg"] and str(allowed) in first["msg"]
+            # 事件数不会少于服务端计数（一一对应：一次拒绝恰好一条事件）
+            assert harness.server.stats.registrations_rejected >= len(rejects)
+
+    asyncio.run(scenario())
+
+
+def test_registration_rejected_event_on_capacity_full() -> None:
+    """容量满（503，可重试）：属于"服务端没位置了"，不是"你没资格"——事件里也要能看出来。"""
+
+    def server_cfg(config: ServerConfig) -> None:
+        config.limits.max_clients = 1
+
+    async def scenario() -> None:
+        async with TunnelHarness(configure_server=server_cfg) as harness:
+            assert harness.server is not None and harness.client is not None
+            server = harness.server
+            rejects = _subscribe_registration_rejections(harness)
+
+            second = TunnelClient(harness.build_client_config(client_id="over-capacity"))
+            task = asyncio.create_task(second.run(), name="over-capacity-client")
+            try:
+                await harness.wait_until(lambda: len(rejects) >= 1, what="容量满事件到达")
+                assert rejects[0]["code"] == 503
+                assert rejects[0]["retryable"] is True
+                assert rejects[0]["client_id"] == "over-capacity"
+                # 不配鉴权 → 身份是 anonymous（**不是**空串：这里身份确实存在）
+                assert rejects[0]["identity"] == "anonymous"
+                assert "上限 1" in rejects[0]["msg"]  # 原因必须是人话 + 具体数字
+            finally:
+                await second.stop()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_registration_rejected_event_on_bad_client_id() -> None:
+    """``client_id`` 非法（400）：这是**此前连日志都没有**的那两条分支之一。
+
+    用裸控制连接发一帧非法 ``register_client``，走完"收 400 回执"的全过程，
+    顺带证明事件里的 ``client_id`` 是**空串**而不是把客户端塞来的原值原样落库
+    （那值未经校验、长度上限是 max_msg_len，落进日志/事件等于给对手一个日志放大器）。
+    """
+
+    async def scenario() -> None:
+        async with TunnelHarness(start_client=False) as harness:
+            assert harness.server is not None
+            rejects = _subscribe_registration_rejections(harness)
+
+            reader, writer = await asyncio.open_connection("127.0.0.1", harness.control_port)
+            try:
+                await send_msg(
+                    writer,
+                    {"type": MsgType.REGISTER_CLIENT, "client_id": "   ", "local_ports": []},
+                )
+                ack = await asyncio.wait_for(recv_msg(reader), timeout=5.0)
+            finally:
+                await close_quietly(writer)
+
+            assert ack["ok"] is False
+            assert ack["code"] == 400
+            assert ack["retryable"] is True
+
+            await harness.wait_until(lambda: len(rejects) >= 1, what="400 拒绝事件到达")
+            assert len(rejects) == 1
+            assert rejects[0]["code"] == 400
+            assert rejects[0]["retryable"] is True
+            assert rejects[0]["client_id"] == ""  # 未校验的值绝不落事件
+            assert "127.0.0.1" in rejects[0]["peer"]
+            assert harness.server.stats.registrations_rejected == 1
+
+    asyncio.run(scenario())
+
+
+def test_registration_rejected_event_is_silent_on_success() -> None:
+    """负命题对照：注册**成功**时一条事件都不发（否则"有事件"就失去信息量）。"""
+
+    async def scenario() -> None:
+        async with TunnelHarness(start_client=False) as harness:
+            assert harness.server is not None
+            rejects = _subscribe_registration_rejections(harness)
+            await harness.start_client()
+            await harness.wait_online()
+
+            assert rejects == []
+            assert harness.server.stats.registrations_rejected == 0
+
+    asyncio.run(scenario())
+

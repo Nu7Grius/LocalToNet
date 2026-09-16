@@ -279,6 +279,36 @@ def _on_mapping_rejected(payload: Mapping[str, Any]) -> _Outcome:
     )
 
 
+def _on_registration_rejected(payload: Mapping[str, Any]) -> _Outcome:
+    """有客户端注册被拒。
+
+    状态栏那个"被拒 N"只回答"拒了几次"；运维真正要看的是**这一次是谁、为什么**——
+    客户端侧的表现往往只是"一直连不上、日志里反复重连"，原因全在这里。
+    所以日志行必须能独立读懂：谁（有身份就带上身份）、从哪来、什么码、什么原因、
+    以及**客户端接下来会继续重试还是会停手**（``retryable``）。
+
+    ``identity`` 可能为空串：鉴权失败时身份从未确立（服务端不会把它写成 anonymous，
+    否则"令牌失效/冒充"会被误读成"匿名用户"）。缺身份就只显示 client_id。
+    """
+    code = payload.get("code")
+    retryable = payload.get("retryable") is True
+    reason = payload.get("msg") or "未知原因"
+    client_id = payload.get("client_id") or "-"
+    peer = payload.get("peer") or "-"
+    identity = payload.get("identity") or ""
+    who = f"{identity}（{client_id}）" if identity else str(client_id)
+    code_text = str(code) if code is not None else "?"
+    # 可重试＝客户端自己会退避重试，运维通常只需修配置；不可重试＝这一端要动手
+    # （换令牌 / 放行 client_id），严重度更高。
+    # 缺 ``retryable`` 时按"不可重试"处理：宁可多标一次黄，也不要让"停止重试"被静默成 info。
+    level = "info" if retryable else "warn"
+    fate = "客户端将继续重试" if retryable else "客户端已停止重试"
+    return _Outcome(
+        logs=((level, f"注册被拒：{who} 来自 {peer} → [{code_text}] {reason}（{fate}）"),),
+        notice=f"注册被拒（{code_text}）：{who}",
+    )
+
+
 def _on_request_end(payload: Mapping[str, Any]) -> _Outcome:
     """服务端的 ``REQUEST_END`` 载荷里**没有**成功与否的字段。
 
@@ -296,6 +326,7 @@ _SERVER_EVENT_HANDLERS = {
     EventType.CLIENT_DISCONNECTED: _on_client_disconnected,
     EventType.CONN_ERROR: _on_conn_error,
     EventType.MAPPING_REJECTED: _on_mapping_rejected,
+    EventType.REGISTRATION_REJECTED: _on_registration_rejected,
     EventType.REQUEST_END: _on_request_end,
 }
 """只登记**需要在面板上留下痕迹**的服务端事件。

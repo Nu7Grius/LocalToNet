@@ -111,21 +111,35 @@ class LegacyTokenAuthenticator(Authenticator):
     共享令牌天然分不出身份（所有人都是同一把钥匙），所以身份标签固定为 ``shared``、
     端口范围为空（＝不限）：端口隔离仍然由端口独占与映射表负责。
 
-    写权限同理给 ``True``：一把钥匙分不出"谁"，也就无法按人授权；这里保持鉴权一期的
-    行为不变，要按身份收口请换令牌表（``auth.file``）。"""
+    写权限**默认仍给** ``True``：一把钥匙分不出"谁"，也就无法按人授权；默认值保持
+    鉴权一期的行为不变。要让"共享令牌持有者也不能改映射表"，用
+    ``auth.shared_can_manage_mapping: false``（配置或
+    ``LOCALTONET_AUTH_SHARED_CAN_MANAGE_MAPPING``）显式收紧；想**按人**授权请换令牌表
+    （``auth.file``），那条路的写权限是逐条目的 ``can_manage_mapping``。
+    """
 
-    name = "token"
-
-    def __init__(self, token: str) -> None:
+    def __init__(self, token: str, *, can_manage_mapping: bool = True) -> None:
         if not token:
             raise AuthError("TokenAuthenticator 需要非空 token")
         self._token = token
+        self._can_manage_mapping = bool(can_manage_mapping)
+
+    @property
+    def name(self) -> str:
+        """启动日志那行 ``鉴权：token`` 与 ``snapshot()["auth"]``（管理台状态栏）用的描述。
+
+        写权限被收紧时**必须显示出来**：这是个默认放行的开关，"我配了但没生效"与
+        "我忘了配"在界面上要能区分开——否则收紧失败会静默无痕。写成属性与
+        :class:`TokenFileAuthenticator` 的 ``token-file(N 条)`` 同一先例
+        （那里也把条目数摆出来，理由就是"状态描述不能含糊"）。
+        """
+        return "token" if self._can_manage_mapping else "token(映射表只读)"
 
     def verify(self, register_msg: Mapping[str, Any], peer: str) -> Identity:
         provided = register_msg.get("token")
         if not isinstance(provided, str) or not compare_secret(provided, self._token):
             raise AuthError(f"客户端 {peer} 提供的 token 不合法")
-        return Identity(name="shared", can_manage_mapping=True)
+        return Identity(name="shared", can_manage_mapping=self._can_manage_mapping)
 
 
 TokenAuthenticator = LegacyTokenAuthenticator
@@ -194,10 +208,16 @@ def build_authenticator(
 
     令牌表损坏 / 缺失时 ``TokenStore.load`` 会抛 :class:`~config.ConfigError`，
     **不静默退回共享令牌、更不放行**——鉴权组件的失败方向必须是"更严"。
+
+    ``config.shared_can_manage_mapping`` 只传给共享令牌那条路：令牌表的写权限
+    是逐条目的 ``can_manage_mapping``，被这个全局开关覆盖会变成一个说不清的
+    "配置说能、文件说不能"的叠加态。
     """
     log = logger or get_logger("server.auth")
     if config is None or not config.enabled:
         return NoneAuthenticator()
     if config.file:
         return TokenFileAuthenticator(TokenStore.load(config.file, logger=log), logger=log)
-    return LegacyTokenAuthenticator(config.token)
+    return LegacyTokenAuthenticator(
+        config.token, can_manage_mapping=config.shared_can_manage_mapping
+    )

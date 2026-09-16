@@ -218,9 +218,18 @@ def test_second_client_cannot_steal_an_owned_port() -> None:
             second = TunnelClient(second_config)
             task = asyncio.create_task(second.run(), name="second-client")
             try:
+                # ⚠️ 等待条件必须同时覆盖**两侧**：
+                #   * 服务端 —— registry 里出现了它（`registry.add()` 之后就为真）；
+                #   * 客户端 —— 它已经**处理完 register_ack**（`claimed` / `conflicts` 是那时才填的）。
+                # 只等前者是不够的：服务端在 `_send(ack)` 之前就已经登记，回执还要走一遍
+                # TCP 才到客户端，中间隔着若干 await。断言在窗口内跑就会读到空列表——
+                # 表现为"全量偶发红、单跑永远绿"（客户端 `state` 也不是可靠信号：
+                # 它在建连成功时就置成 `online`，早于回执处理）。
                 await harness.wait_until(
-                    lambda: harness.server is not None and harness.server.registry.has("test-second"),
-                    what="第二个客户端注册",
+                    lambda: harness.server is not None
+                    and harness.server.registry.has("test-second")
+                    and bool(second.conflicted_ports or second.claimed_ports),
+                    what="第二个客户端完成注册并处理完 register_ack",
                 )
 
                 assert second.claimed_ports == []

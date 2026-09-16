@@ -209,6 +209,83 @@ def test_auth_file_survives_roundtrip() -> None:
     assert again.auth.enabled is True
 
 
+# --------------------------------------------------------------------------- #
+# auth.shared_can_manage_mapping：共享令牌模式下"能不能改映射表"的开关
+# --------------------------------------------------------------------------- #
+#
+# 默认必须是 **True**（＝保持鉴权一期以来的行为）：升级不该悄悄改掉任何现有部署的能力。
+# 反向的错法（默认 False）会让"只有一把钥匙"的部署在升级后突然改不动映射表，
+# 而且症状是 403 + "去令牌表加字段"——那条建议在共享令牌部署里根本不存在。
+
+
+def test_shared_mapping_write_defaults_to_open() -> None:
+    """省略该字段＝保持现状：共享令牌持有者仍可改映射表（与 ``Identity("shared")`` 一致）。"""
+    assert AuthConfig().shared_can_manage_mapping is True
+    assert AuthConfig.from_dict(None).shared_can_manage_mapping is True
+    assert AuthConfig.from_dict({"enabled": True, "token": "x"}).shared_can_manage_mapping is True
+    # 整个 ServerConfig 走一遍，证明字段真的接进了 from_dict（而不是只在 dataclass 上躺着）
+    cfg = ServerConfig(mapping=[MappingRule(9028, 8000)])
+    assert cfg.auth.shared_can_manage_mapping is True
+
+
+def test_shared_mapping_write_can_be_disabled_from_json() -> None:
+    """显式 ``false`` 收紧共享令牌的写权限——这是本轮唯一能关掉那条路的手段。"""
+    cfg = ServerConfig.from_dict(
+        {
+            "mapping": [{"public_port": 9028, "local_port": 8000}],
+            "auth": {"enabled": True, "token": "s3cret", "shared_can_manage_mapping": False},
+        }
+    )
+
+    assert cfg.auth.shared_can_manage_mapping is False
+    # 开关必须能活着穿过序列化（否则"存盘一次就悄悄变回允许"）
+    assert ServerConfig.from_dict(cfg.to_dict()).auth.shared_can_manage_mapping is False
+
+
+def test_env_shared_mapping_write_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """环境变量是字符串，``"false"`` 必须真能关掉，而不是被当成真值放行。"""
+    monkeypatch.setenv("LOCALTONET_AUTH_TOKEN", "s3cret")
+    monkeypatch.setenv("LOCALTONET_AUTH_SHARED_CAN_MANAGE_MAPPING", "false")
+
+    cfg = ServerConfig.from_env(ServerConfig(mapping=[MappingRule(9028, 8000)]))
+
+    assert cfg.auth.token == "s3cret"
+    assert cfg.auth.shared_can_manage_mapping is False
+    # 反过来也要认（"0"/"off" 之类由 _as_env_bool 统一处理）
+    monkeypatch.setenv("LOCALTONET_AUTH_SHARED_CAN_MANAGE_MAPPING", "1")
+    assert ServerConfig.from_env(
+        ServerConfig(mapping=[MappingRule(9028, 8000)])
+    ).auth.shared_can_manage_mapping is True
+
+
+def test_bad_shared_mapping_write_value_is_rejected() -> None:
+    """``"false"`` / ``0`` / ``[]`` 这类"看着像关了"的写法必须报错，不做隐式转换。
+
+    权限字段最怕"我以为关了，其实没关"——静默解释等于把安全开关做成摆设。
+    """
+    for value in ("true", 0, 1, [], None):
+        with pytest.raises(ConfigError, match="shared_can_manage_mapping"):
+            AuthConfig.from_dict({"enabled": True, "token": "x", "shared_can_manage_mapping": value})
+
+
+def test_shared_mapping_write_typo_is_rejected() -> None:
+    """写错一个词也要 fail fast，不能悄悄退回默认（那会静默保持"允许"）。"""
+    with pytest.raises(ConfigError, match="未知字段"):
+        ServerConfig.from_dict(
+            {
+                "mapping": [{"public_port": 9028, "local_port": 8000}],
+                "auth": {"enabled": True, "token": "x", "shared_mapping_write": False},
+            }
+        )
+
+
+def test_bad_env_shared_mapping_write_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LOCALTONET_AUTH_SHARED_CAN_MANAGE_MAPPING", "maybe")
+
+    with pytest.raises(ConfigError, match="LOCALTONET_AUTH_SHARED_CAN_MANAGE_MAPPING"):
+        ServerConfig.from_env(ServerConfig(mapping=[MappingRule(9028, 8000)]))
+
+
 def test_client_rejects_empty_local_ports() -> None:
     with pytest.raises(ConfigError, match="local_ports 不能为空"):
         ClientConfig(local_ports=[]).validate()
