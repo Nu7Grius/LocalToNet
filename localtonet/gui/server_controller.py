@@ -40,13 +40,17 @@ SERVER_SUBSCRIPTIONS = (
     EventType.CLIENT_CONNECTED,
     EventType.CLIENT_DISCONNECTED,
     EventType.CONN_ERROR,
+    EventType.MAPPING_REJECTED,
 )
 """转发给管理台的事件白名单。
 
 刻意**不含** ``REQUEST_START`` / ``REQUEST_END`` / ``DATA_CHANNEL_OPENED``：
 服务端的 ``REQUEST_END`` 载荷里没有成功标志，写不出有信息量的日志，
 而它每次请求都触发——塞进邮筒只会让面板被自己刷爆，
-真正的计数已经由 ``snapshot()`` 覆盖。"""
+真正的计数已经由 ``snapshot()`` 覆盖。
+
+``MAPPING_REJECTED`` 属于**安全事件**：它罕见、且运维必须看见
+（"某个身份一直改不动映射表"要能一眼定位到是权限没给，而不是界面上瞎猜）。"""
 
 
 class ServerController:

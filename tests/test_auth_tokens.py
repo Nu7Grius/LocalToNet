@@ -16,6 +16,7 @@ tests/test_auth_tokens.py —— 鉴权二期：令牌表 + 按内网端口授�
 4. **安全铁律**：重载失败（损坏 / 消失）**保留旧表**，绝不降级为放行；
    令牌明文**一次都不出现**在日志、事件与 ``ClientSession.register_msg`` 里。
 5. **时序侧信道**：令牌比较必须走完全部条目（含被吊销的），用假比较函数数调用次数来钉。
+6. **映射表写权限**：默认关闭（fail closed）、逐条目授权、注册时快照进会话、管理台豁免。
 
 全程用 ``tests.helpers.TunnelHarness`` 拉真实三件套走真实 TCP，不 mock。
 注册注定失败的用例一律 ``expect_online=False``，断言一律"轮询到达条件 + 死线"，
@@ -39,6 +40,7 @@ from localtonet.client.core import TunnelClient
 from localtonet.core.events import EventType
 from localtonet.errors import AuthError
 from localtonet.server.auth import (
+    ANONYMOUS,
     Identity,
     LegacyTokenAuthenticator,
     NoneAuthenticator,
@@ -903,3 +905,231 @@ def test_auth_error_retryable_defaults_to_permanent() -> None:
     """``AuthError`` 默认永久失败（鉴权一期语义），可重试必须显式说明。"""
     assert AuthError("令牌无效").retryable is False
     assert AuthError("端口未授权", retryable=True).retryable is True
+
+
+# --------------------------------------------------------------------------- #
+# 映射表写权限（本轮新增）：收口 README 已承认的"任何在线客户端都能改映射表"
+# --------------------------------------------------------------------------- #
+#
+# 四条验收线，每条都要能**证伪**（不只是"改成了"）：
+#   1. 默认关闭：省略字段 → 改不动，且**映射表一个字都没变**（不是只回执说失败）。
+#   2. 显式放行：`can_manage_mapping: true` → 改得动，且新端口**真的能通**。
+#   3. 权限是**注册时快照**：热重载不影响已建立会话，重连才生效。
+#   4. 管理台豁免：同进程写入口不受身份判定约束（否则管理台把自己锁死）。
+
+
+def _rules_to_add(harness: TunnelHarness, extra_port: int) -> List[MappingRule]:
+    """harness 现有那条映射，再加上一个要新建的公网端口。"""
+    return [
+        MappingRule(
+            public_port=harness.public_port, local_port=harness.backend.port, host="127.0.0.1"
+        ),
+        MappingRule(public_port=extra_port, local_port=harness.backend.port, host="127.0.0.1"),
+    ]
+
+
+def test_mapping_write_flag_defaults_closed(tmp_path: Path) -> None:
+    """解析层：省略 ``can_manage_mapping`` ＝ 不许改映射表（fail closed）。"""
+    table = write_table(
+        tmp_path / "tokens.json",
+        {"name": "alice", "token": ALICE},
+        {"name": "bob", "token": BOB, "can_manage_mapping": True},
+    )
+    store = TokenStore.load(table)
+    alice, bob = store.lookup(ALICE), store.lookup(BOB)
+    assert alice is not None and bob is not None
+    assert alice.can_manage_mapping is False
+    assert bob.can_manage_mapping is True
+
+
+def test_identity_mapping_write_defaults_closed() -> None:
+    """``Identity`` 的默认值也必须是"不能"：将来新写的校验器忘了表态，结果应是"改不动全局映射表"。
+
+    另两个例外的理由写在 ``server/auth.py`` 里：不校验的部署没有身份概念（``anonymous``），
+    共享令牌一把钥匙分不出人（``shared``），收紧它们只会误伤一期以来的行为。
+    """
+    assert Identity(name="x").can_manage_mapping is False
+    assert ANONYMOUS.can_manage_mapping is True
+    assert LegacyTokenAuthenticator("t").verify({"token": "t"}, "p").can_manage_mapping is True
+
+
+def test_bad_mapping_write_flag_is_rejected(tmp_path: Path) -> None:
+    """``0`` / ``1`` / ``"true"`` 这类"看起来像开了"的写法必须报错，不做隐式转换。
+
+    权限字段最怕的就是"我以为开了，其实没生效"——静默解释等于把安全开关做成摆设。
+    """
+    for value in (0, 1, "true", "yes", []):
+        table = write_table(
+            tmp_path / "tokens.json",
+            {"name": "alice", "token": ALICE, "can_manage_mapping": value},
+        )
+        with pytest.raises(ConfigError, match="布尔值"):
+            TokenStore.load(table)
+
+
+def test_mapping_edit_denied_without_permission(tmp_path: Path) -> None:
+    """默认条目改不动映射表——**映射表一个字都没变**，而不只是"回执说了 ok=false"。"""
+    table = write_table(tmp_path / "tokens.json", {"name": "alice", "token": ALICE})
+    extra_port = free_ports(1)[0]
+
+    async def scenario() -> None:
+        async with TunnelHarness(
+            configure_server=auth_file_server(table),
+            configure_client=token_client(ALICE),
+        ) as harness:
+            assert harness.server is not None and harness.client is not None
+            server, client = harness.server, harness.client
+
+            rejects: List[Dict[str, Any]] = []
+            server.events.on(EventType.MAPPING_REJECTED, lambda **payload: rejects.append(payload))
+            before = [rule.to_dict() for rule in server.mapping.rules()]
+            listens_before = list(server.mapping.listen_ports())
+            rejected_before = server.stats.registrations_rejected
+
+            result = await client.set_mapping(_rules_to_add(harness, extra_port))
+
+            # 回执：ok=false **且**带 code=403 —— 客户端与界面能机器区分"没权限"与"参数非法"
+            assert result["ok"] is False
+            assert result["code"] == 403
+            assert "权限" in result["msg"]
+
+            # 实质证据：映射表与监听端口零变化，新端口连不上
+            assert [rule.to_dict() for rule in server.mapping.rules()] == before
+            assert list(server.mapping.listen_ports()) == listens_before
+            with pytest.raises(OSError):
+                await http_request(extra_port, "/", timeout=3.0)
+            # 原有端口照常可用（拒绝不该有副作用）
+            assert (await http_request(harness.public_port, "/echo?msg=still")).body == b"still\n"
+
+            # 服务端侧可观测：计数 + 事件，且**不是**注册被拒（两者混在一起就分不清该查什么）
+            assert server.stats.mapping_rejected == 1
+            assert server.stats.registrations_rejected == rejected_before
+            assert len(rejects) == 1
+            assert rejects[0]["identity"] == "alice"
+            assert rejects[0]["client_id"] == client.client_id
+
+            # 会话快照带上写权限，管理台据此显示"谁能改"
+            session = server.registry.get(client.client_id)
+            assert session is not None
+            assert session.can_manage_mapping is False
+            assert session.snapshot()["can_manage_mapping"] is False
+
+    asyncio.run(scenario())
+
+
+def test_mapping_edit_allowed_with_permission(tmp_path: Path) -> None:
+    """显式 ``can_manage_mapping: true`` 才改得动，且改完的新端口**真的能通**（正例也要能证伪）。"""
+    table = write_table(
+        tmp_path / "tokens.json",
+        {"name": "alice", "token": ALICE, "can_manage_mapping": True},
+    )
+    extra_port = free_ports(1)[0]
+
+    async def scenario() -> None:
+        async with TunnelHarness(
+            configure_server=auth_file_server(table),
+            configure_client=token_client(ALICE),
+        ) as harness:
+            assert harness.server is not None and harness.client is not None
+            result = await harness.client.set_mapping(_rules_to_add(harness, extra_port))
+
+            assert result["ok"] is True, result
+            assert extra_port in result["diff"]["added"]
+            assert (await http_request(extra_port, "/echo?msg=perm")).body == b"perm\n"
+            assert harness.server.stats.mapping_rejected == 0
+
+    asyncio.run(scenario())
+
+
+def test_shared_token_keeps_mapping_write() -> None:
+    """共享令牌（``auth.token``）保持一期行为：**仍可**改映射表——证伪"一刀切拒绝"。"""
+
+    def server_cfg(config: ServerConfig) -> None:
+        config.auth.enabled = True
+        config.auth.token = "legacy-shared"
+
+    extra_port = free_ports(1)[0]
+
+    async def scenario() -> None:
+        async with TunnelHarness(
+            configure_server=server_cfg,
+            configure_client=token_client("legacy-shared"),
+        ) as harness:
+            assert harness.server is not None and harness.client is not None
+            session = harness.server.registry.get(harness.client.client_id)
+            assert session is not None and session.identity == "shared"
+            assert session.can_manage_mapping is True
+
+            result = await harness.client.set_mapping(_rules_to_add(harness, extra_port))
+            assert result["ok"] is True, result
+            assert harness.server.stats.mapping_rejected == 0
+
+    asyncio.run(scenario())
+
+
+def test_mapping_permission_is_snapshot_at_register(tmp_path: Path) -> None:
+    """权限在**注册时**定格：改令牌表不影响已建立会话，**重连**之后才生效。
+
+    这条钉的是"快照 vs 每次回查"的取舍：会话里早已没有令牌可查（注册成功即抹掉），
+    所以唯一自洽的语义就是快照——"身份不变则权限不变"，与"已建立的连接不因令牌轮换
+    而断开"是同一条。将来若有人想顺手改成"每次提交回查令牌表"，先撞上这条用例。
+    """
+    table = tmp_path / "tokens.json"
+    write_table(table, {"name": "alice", "token": ALICE})
+    extra_port = free_ports(1)[0]
+
+    async def scenario() -> None:
+        async with TunnelHarness(
+            configure_server=auth_file_server(table),
+            configure_client=token_client(ALICE),
+        ) as harness:
+            assert harness.server is not None and harness.client is not None
+            server = harness.server
+            rules = _rules_to_add(harness, extra_port)
+
+            first = await harness.client.set_mapping(rules)
+            assert first["ok"] is False and first["code"] == 403
+
+            # 运维补上写权限（热重载对**下一次注册**生效，对已有会话无效）
+            write_table(table, {"name": "alice", "token": ALICE, "can_manage_mapping": True})
+
+            again = await harness.client.set_mapping(rules)
+            assert again["ok"] is False, "已建立会话的权限不该被热重载改掉"
+            assert server.stats.mapping_rejected == 2
+
+            # 重连之后才上车：另起一个客户端（同令牌，不同 client_id）
+            async with extra_client(harness, client_id="alice-2", token=ALICE) as second:
+                await harness.wait_until(
+                    lambda: server.registry.has("alice-2"),
+                    what="alice-2 完成注册",
+                )
+                assert server.registry.get("alice-2").can_manage_mapping is True  # type: ignore[union-attr]
+                assert (await second.set_mapping(rules))["ok"] is True
+
+    asyncio.run(scenario())
+
+
+def test_management_console_bypasses_mapping_permission(tmp_path: Path) -> None:
+    """管理台走 ``submit_mapping``：**本机同进程**的写入口，不受身份判定约束。
+
+    给它加判定等于把管理台自己锁死（管理台没有"身份"）。这条同时是"边界"的回归线：
+    权限只拦**客户端指令**，不拦服务端自己的管理动作。
+    """
+    table = write_table(tmp_path / "tokens.json", {"name": "alice", "token": ALICE})
+    extra_port = free_ports(1)[0]
+
+    async def scenario() -> None:
+        async with TunnelHarness(
+            configure_server=auth_file_server(table),
+            configure_client=token_client(ALICE),
+        ) as harness:
+            assert harness.server is not None
+            server = harness.server
+            diff = await server.submit_mapping(_rules_to_add(harness, extra_port))
+
+            assert extra_port in diff.added
+            assert (await http_request(extra_port, "/echo?msg=console")).body == b"console\n"
+            # 客户端侧没有任何一次"被拒"——拒绝是身份的属性，不是映射表的属性
+            assert server.stats.mapping_rejected == 0
+
+    asyncio.run(scenario())

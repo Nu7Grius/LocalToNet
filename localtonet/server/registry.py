@@ -48,6 +48,13 @@ class ClientSession:
 
     注意这是**标签**不是凭据——令牌明文绝不进会话（MEMORY 不变量 1）。
     """
+    can_manage_mapping: bool = False
+    """能否修改服务端映射表。**注册时从 :class:`~localtonet.server.auth.Identity` 快照下来**。
+
+    刻意不做成"每次提交时回查令牌表"：注册消息里的令牌当场就被抹掉了（见
+    ``server/core.py``），会话上再没有可校验的凭据；而且"身份不变则权限不变"
+    与"已建立的连接不因令牌轮换而断开"是同一条语义。改权限 → 客户端重连生效。
+    """
     local_ports: Set[int] = field(default_factory=set)
     connected_at: float = field(default_factory=time.monotonic)
     last_seen: float = field(default_factory=time.monotonic)
@@ -66,6 +73,7 @@ class ClientSession:
             "client_id": self.client_id,
             "peer": self.peer,
             "identity": self.identity,
+            "can_manage_mapping": self.can_manage_mapping,
             "local_ports": sorted(self.local_ports),
             "online_seconds": round(time.monotonic() - self.connected_at, 1),
             "idle_seconds": round(self.idle_for(), 1),

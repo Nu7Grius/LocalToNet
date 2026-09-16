@@ -37,6 +37,7 @@ import pytest
 from config import ClientConfig, MappingRule, ServerConfig
 from examples.demo_backend import DemoBackend
 from localtonet.client.core import TunnelClient
+from localtonet.core.events import EventType
 from localtonet.gui.bridge import LoopThread, UiBridge
 from localtonet.gui.server_controller import ServerController
 from localtonet.gui.server_viewmodel import REMOTE_STALE_NOTICE, ServerViewModel
@@ -216,6 +217,46 @@ def test_admin_starts_server_and_sees_client_identity(run_async) -> None:
                 await client.stop()
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(client_task, timeout=5)
+
+        await backend.stop()
+
+    run_async(scenario)
+
+
+def test_admin_sees_mapping_rejection_event(run_async) -> None:
+    """有身份改不动映射表时，管理台**必须**看到那行日志（转发白名单 + 渲染两头都要通）。
+
+    这条专门盯"事件转发白名单"这个最容易漏的接缝：``SERVER_SUBSCRIPTIONS`` 少登记一个事件，
+    服务端日志里一切正常、界面上却什么都没有——静默丢失比报错难查得多。
+    """
+
+    async def scenario() -> None:
+        backend = DemoBackend("127.0.0.1", 0)
+        backend_port = await backend.start()
+        ports = free_ports(3)
+        config = build_server_config(backend_port=backend_port, ports=tuple(ports))
+
+        with admin_runtime(config) as (loop_thread, bridge, controller):
+            vm = ServerViewModel(idle_timeout=config.timeouts.client_idle_timeout)
+            await await_thread(loop_thread.submit(controller.start()))
+            await pump_until(vm, bridge, lambda: vm.state.listening, what="管理台收到启动快照")
+
+            # 服务端跑在**另一个线程**的事件循环里。`emit` 是同步调用、订阅者只往邮筒
+            # `put_nowait`，所以这里直接触发即可，不参与那个循环的调度（也不需要它）。
+            controller.server.events.emit(
+                EventType.MAPPING_REJECTED,
+                client_id="alice-1",
+                identity="alice",
+                reason="无映射表写权限",
+            )
+            await pump_until(
+                vm,
+                bridge,
+                lambda: any("映射表改动被拒" in entry.text for entry in vm.state.log),
+                what="拒绝事件到达管理台日志",
+            )
+            assert any("alice-1" in entry.text for entry in vm.state.log)
+            assert "alice" in (vm.state.notice or "")
 
         await backend.stop()
 

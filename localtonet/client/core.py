@@ -497,7 +497,11 @@ class TunnelClient:
         waiter = self._mapping_waiter
         if waiter is not None and not waiter.done():
             waiter.set_result(dict(msg))
-        self._log.info("映射修改回执：ok=%s %s", msg.get("ok"), msg.get("msg"))
+        # 失败回执里可能带 code（403＝没有映射表写权限），日志与 register_ack 一样把它带上，
+        # 免得运维在"权限不足"与"参数写错"之间来回猜
+        code = msg.get("code")
+        detail = f"code={code} " if code is not None else ""
+        self._log.info("映射修改回执：ok=%s %s%s", msg.get("ok"), detail, msg.get("msg"))
 
     # ------------------------------------------------------------------ #
     # 对外动作

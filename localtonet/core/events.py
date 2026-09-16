@@ -32,6 +32,11 @@ class EventType:
     CLIENT_DISCONNECTED = "client_disconnected"
 
     MAPPING_CHANGED = "mapping_changed"
+    MAPPING_REJECTED = "mapping_rejected"
+    """客户端的 ``set_mapping`` 因**身份无映射表写权限**被拒。
+
+    只有"没权限"这一种原因会发它；mapping 格式非法之类仍只进日志——
+    前者是安全事件（有价值，管理台要看），后者是调用方自己的 bug（会刷屏）。"""
 
     REQUEST_START = "request_start"
     REQUEST_END = "request_end"

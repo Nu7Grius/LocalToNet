@@ -263,6 +263,22 @@ def _on_conn_error(payload: Mapping[str, Any]) -> _Outcome:
     return _Outcome(logs=(("warn", f"转发失败（客户端 {client_id}，内网端口 {local_port}）：{reason}"),))
 
 
+def _on_mapping_rejected(payload: Mapping[str, Any]) -> _Outcome:
+    """有身份试图改映射表但没有写权限。
+
+    这条必须在面板上留下痕迹：它是**安全事件**，而且运维看到它的第一反应
+    应该是"去令牌表里给该条目加 ``can_manage_mapping: true`` 并让客户端重连"，
+    所以日志行要把身份和客户端 id 一起写清楚。
+    """
+    identity = payload.get("identity") or ANONYMOUS_IDENTITY
+    client_id = payload.get("client_id") or "-"
+    reason = payload.get("reason") or "无映射表写权限"
+    return _Outcome(
+        logs=(("warn", f"映射表改动被拒：{identity}（{client_id}）—— {reason}"),),
+        notice=f"{identity} 没有映射表写权限",
+    )
+
+
 def _on_request_end(payload: Mapping[str, Any]) -> _Outcome:
     """服务端的 ``REQUEST_END`` 载荷里**没有**成功与否的字段。
 
@@ -279,6 +295,7 @@ _SERVER_EVENT_HANDLERS = {
     EventType.CLIENT_CONNECTED: _on_client_connected,
     EventType.CLIENT_DISCONNECTED: _on_client_disconnected,
     EventType.CONN_ERROR: _on_conn_error,
+    EventType.MAPPING_REJECTED: _on_mapping_rejected,
     EventType.REQUEST_END: _on_request_end,
 }
 """只登记**需要在面板上留下痕迹**的服务端事件。

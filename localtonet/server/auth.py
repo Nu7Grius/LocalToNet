@@ -21,6 +21,11 @@ localtonet.server.auth —— 客户端鉴权
 （``server/core.py``）——那里才知道本次 ``local_ports`` 是什么，
 也才能把未授权的端口整体列出来一次性拒绝。
 
+**唯一的例外是映射表写权限**（``Identity.can_manage_mapping``）：它不依赖任何上下文
+（"你能改映射表吗"与本次注册带了什么无关），所以校验器一次答完，
+由注册流程快照进 ``ClientSession``；``set_mapping`` 只读会话上那个布尔值，
+不再回头查令牌表（那时令牌已被抹掉）。
+
 要换成别的方案（mTLS、签名挑战、一次性票据、对接公司 SSO），
 只需要写一个新的 ``Authenticator`` 子类，注册流程一行都不用改。
 """
@@ -54,19 +59,28 @@ class Identity:
 
     ``ports`` 是**允许认领的内网端口**（``local_ports``），**空＝不限**——
     与 ``limits`` 里 ``0``＝不限一脉相承；要禁止一切认领请用 ``enabled: false`` 吊销令牌。
+
+    ``can_manage_mapping`` 是**能否修改服务端映射表**（``set_mapping``）。
+    默认 ``False`` ＝ fail closed：新写的校验器忘了表态，结果是"改不动全局映射表"，
+    而不是"悄悄放开"。要放行的实现必须显式写 ``True``。
     """
 
     name: str
     ports: Tuple[int, ...] = ()
     client_id: str = ""
+    can_manage_mapping: bool = False
 
     def allows(self, local_port: int) -> bool:
         """该身份能否认领某个内网端口。空 ``ports`` ＝不限。"""
         return not self.ports or local_port in self.ports
 
 
-ANONYMOUS = Identity(name="anonymous")
-"""匿名身份：不限端口。只在不校验的部署里出现。"""
+ANONYMOUS = Identity(name="anonymous", can_manage_mapping=True)
+"""匿名身份：不限端口、可改映射表。只在不校验的部署里出现。
+
+写权限给 ``True`` 不是"图省事"：``--no-auth`` 部署里**根本没有身份概念**，
+映射表写权限也就无从谈起。把它收成 ``False`` 只会让"关掉鉴权的单机演示"
+突然改不动映射表——那是把一个不存在的主体当成受限主体，纯属误伤。"""
 
 
 class Authenticator(ABC):
@@ -96,7 +110,9 @@ class LegacyTokenAuthenticator(Authenticator):
 
     共享令牌天然分不出身份（所有人都是同一把钥匙），所以身份标签固定为 ``shared``、
     端口范围为空（＝不限）：端口隔离仍然由端口独占与映射表负责。
-    """
+
+    写权限同理给 ``True``：一把钥匙分不出"谁"，也就无法按人授权；这里保持鉴权一期的
+    行为不变，要按身份收口请换令牌表（``auth.file``）。"""
 
     name = "token"
 
@@ -109,7 +125,7 @@ class LegacyTokenAuthenticator(Authenticator):
         provided = register_msg.get("token")
         if not isinstance(provided, str) or not compare_secret(provided, self._token):
             raise AuthError(f"客户端 {peer} 提供的 token 不合法")
-        return Identity(name="shared")
+        return Identity(name="shared", can_manage_mapping=True)
 
 
 TokenAuthenticator = LegacyTokenAuthenticator
@@ -156,7 +172,14 @@ class TokenFileAuthenticator(Authenticator):
                 f"身份 {entry.name} 只允许 client_id={entry.client_id!r}，"
                 f"实际为 {register_msg.get('client_id')!r}"
             )
-        return Identity(name=entry.name, ports=entry.ports, client_id=entry.client_id)
+        return Identity(
+            name=entry.name,
+            ports=entry.ports,
+            client_id=entry.client_id,
+            # 写权限**逐条目**：映射表是全局的，而"能不能认领自己的内网端口"
+            # 与"能不能改全站映射"是两件事，不能用一个开关糊在一起（见 README 已知限制）
+            can_manage_mapping=entry.can_manage_mapping,
+        )
 
 
 def build_authenticator(

@@ -84,10 +84,13 @@ class ServerStats:
     ``clients_online`` 是唯一的 **gauge**（当前值），其余都是累计值。
     ``requests_rejected`` 与 ``requests_failed`` 刻意分开：
     前者是"压根没开始转发"（配额拒绝），后者是"转了但失败了"。
+    ``mapping_rejected`` 只统计**因身份无写权限**被拒的 ``set_mapping``——
+    mapping 内容非法属于调用方 bug，不记在这里，免得安全事件淹没在噪声里。
     """
 
     clients_registered: int = 0
     registrations_rejected: int = 0
+    mapping_rejected: int = 0
     clients_online: int = 0
     requests_total: int = 0
     requests_failed: int = 0
@@ -101,6 +104,7 @@ class ServerStats:
         return {
             "clients_registered": self.clients_registered,
             "registrations_rejected": self.registrations_rejected,
+            "mapping_rejected": self.mapping_rejected,
             "clients_online": self.clients_online,
             "requests_total": self.requests_total,
             "requests_failed": self.requests_failed,
@@ -449,6 +453,9 @@ class TunnelServer:
             writer=writer,
             peer=peer,
             identity=identity.name,
+            # 写权限在注册时**快照**进会话：令牌到此已被抹掉，之后没有可回查的凭据；
+            # 也正是"改令牌表 → 重连生效"这条语义的落点（详见 ClientSession 字段注释）
+            can_manage_mapping=identity.can_manage_mapping,
             register_msg=sanitized,
         )
 
@@ -602,7 +609,36 @@ class TunnelServer:
 
     @handler(MsgType.SET_MAPPING)
     async def _on_set_mapping(self, msg: Dict[str, Any], session: ClientSession) -> None:
-        """动态修改映射表。"""
+        """动态修改映射表。**需要该身份具备写权限**（``Identity.can_manage_mapping``）。"""
+        # 权限判定刻意排在**格式校验之前**：一个改不动映射表的客户端，
+        # 连"你的 mapping 格式哪里不对"都不必知道——少一处信息泄露面，也少一次白做的解析。
+        #
+        # 这条判定**只覆盖客户端指令**。管理台走 ``submit_mapping()``：它在本机同进程里，
+        # 没有"身份"可言，给它加判定等于把管理台自己锁死（README 已写明该边界）。
+        if not session.can_manage_mapping:
+            reason = (
+                f"身份 {session.identity or 'anonymous'} 没有修改映射表的权限"
+                "（需要该令牌表条目 can_manage_mapping: true；改完令牌表需该客户端重连才生效）"
+            )
+            self._stats.mapping_rejected += 1
+            self._log.warning(
+                "拒绝客户端 %s（身份 %s）的 set_mapping：无映射表写权限",
+                session.client_id,
+                session.identity or "anonymous",
+            )
+            self._events.emit(
+                EventType.MAPPING_REJECTED,
+                client_id=session.client_id,
+                identity=session.identity or "anonymous",
+                reason="无映射表写权限",
+            )
+            # 回执专门带 code=403（与 register_ack 同一套 HTTP 语义），
+            # 让客户端与 GUI 能机器区分"没权限"与"参数非法"；msg 本身也写得可以直接照做。
+            await self._send(
+                session, make_msg(MsgType.MAPPING_RESULT, ok=False, code=403, msg=reason)
+            )
+            return
+
         raw = msg.get("mapping")
         if not isinstance(raw, list):
             await self._send(session, make_msg(MsgType.MAPPING_RESULT, ok=False, msg="mapping 必须是数组"))

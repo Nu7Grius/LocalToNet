@@ -7,7 +7,7 @@ localtonet.server.tokenstore —— 令牌表（**唯一出处**）
 和 ``server/mapping.py``（映射存储）、``core/tls.py``（SSL 上下文）同一个定位：
 **只有这一个地方解析令牌表格式**，别处一律不许自己 ``json.load`` 一遍。
 
-四条刻意的设计
+五条刻意的设计
 --------------
 
 **1. 只放独立文件，不内联进 ``config.json``。**
@@ -27,6 +27,10 @@ localtonet.server.tokenstore —— 令牌表（**唯一出处**）
 ``lookup`` 里刻意**不 break**：命中即 ``return`` 会让"第几条匹配上了""前缀匹配了多久"
 从耗时上泄漏出去（时序侧信道）。被 ``enabled: false`` 吊销的条目同样要参与比较——
 否则"这个令牌存在但被吊销"与"这个令牌根本不存在"在耗时上可区分。
+
+**5. 映射表写权限默认关闭（fail closed）。**
+``can_manage_mapping`` 省略时为 ``False``：映射表是**全局**的，能改它就能把任意访客端口
+指向自己的机器。它和 ``enabled`` 一样属于安全开关，默认值必须落在更严的一侧。
 
 令牌明文**绝不进日志**（连 DEBUG 都不行，见 MEMORY 不变量 1）。
 ``TokenEntry`` 里也因此**不含**密钥字段：可以被放心地塞进日志、事件与快照。
@@ -53,7 +57,15 @@ TOKEN_TABLE_VERSION = 1
 """令牌表顶层 ``version`` 只接受这一个值。将来改格式时用它把老文件挡住。"""
 
 _ROOT_FIELDS = ("version", "tokens")
-_ENTRY_FIELDS = ("name", "token", "token_sha256", "client_id", "ports", "enabled")
+_ENTRY_FIELDS = (
+    "name",
+    "token",
+    "token_sha256",
+    "client_id",
+    "ports",
+    "enabled",
+    "can_manage_mapping",
+)
 
 _HEX64 = re.compile(r"[0-9a-fA-F]{64}")
 
@@ -91,6 +103,20 @@ class TokenEntry:
 
     enabled: bool = True
     """``false`` ＝吊销。条目仍参与比较（见模块 docstring 第 4 条）。"""
+
+    can_manage_mapping: bool = False
+    """能否修改**服务端的映射表**（``set_mapping`` 指令）。
+
+    默认 ``False`` ＝ **fail closed**。映射表是全局的：一张表决定"哪个公网端口
+    通往哪台内网机器"，一个能改它的客户端就能把任意访客端口指到自己的机器上。
+    要放行必须在条目里显式写 ``"can_manage_mapping": true``——
+    忘了表态的结果是"改不动映射表"，而不是"悄悄放开全局映射表"。
+
+    判定时机是**注册**，不是每次提交：注册通过后这个值被快照进
+    ``ClientSession``，会话期间不再回查令牌表（那时令牌已被抹掉，见
+    ``server/core.py`` 的注册段）。因此**改文件后需要该客户端重连才生效**——
+    与"已建立的连接不因令牌轮换而断开"是同一条语义。
+    """
 
     def allows(self, local_port: int) -> bool:
         """该身份能否认领某个内网端口。空 ``ports`` ＝不限。"""
@@ -152,11 +178,16 @@ def _as_ports(value: Any, where: str) -> Tuple[int, ...]:
     return tuple(sorted(ports))
 
 
-def _as_enabled(value: Any, where: str) -> bool:
+def _as_flag(value: Any, where: str, field: str, *, default: bool) -> bool:
+    """三态布尔：省略取 ``default``，给了就必须是布尔。
+
+    ``0`` / ``"true"`` / ``"yes"`` 一律报错，不做隐式转换——本项目一贯 fail fast，
+    而权限字段最怕的就是"我写了 can_manage_mapping: 1 以为开了，其实没开/没生效"。
+    """
     if value is None:
-        return True
+        return default
     if not isinstance(value, bool):
-        raise ConfigError(f"{where}.enabled 必须是布尔值，实际为 {type(value).__name__}")
+        raise ConfigError(f"{where}.{field} 必须是布尔值，实际为 {type(value).__name__}")
     return value
 
 
@@ -199,7 +230,11 @@ def _parse_entry(item: Any, where: str, seen_names: set[str]) -> _StoredToken:
             name=name,
             client_id=client_id.strip(),
             ports=_as_ports(data.get("ports"), where),
-            enabled=_as_enabled(data.get("enabled"), where),
+            enabled=_as_flag(data.get("enabled"), where, "enabled", default=True),
+            # 省略＝不允许改映射表（fail closed，理由见 TokenEntry 的字段注释）
+            can_manage_mapping=_as_flag(
+                data.get("can_manage_mapping"), where, "can_manage_mapping", default=False
+            ),
         ),
         kind=kind,
         secret=secret,

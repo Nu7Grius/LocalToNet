@@ -269,6 +269,33 @@ def test_conn_error_logs_failure_reason() -> None:
     assert "Connection refused" in state.log[-1].text
 
 
+def test_mapping_rejected_event_lands_in_panel() -> None:
+    """映射表写权限被拒是**安全事件**，必须在面板上留下"谁被拒了"。
+
+    运维看到它的第一反应应该是"去令牌表给该条目加 can_manage_mapping"，
+    所以身份与 client_id 都要出现在日志行里，光有一句"被拒"等于没说。
+    """
+    state = apply_server_event(
+        ServerState(),
+        EventType.MAPPING_REJECTED,
+        client_id="alice-1",
+        identity="alice",
+        reason="无映射表写权限",
+    )
+    assert len(state.log) == 1
+    assert state.log[-1].level == "warn"
+    assert "alice" in state.log[-1].text and "alice-1" in state.log[-1].text
+    assert "无映射表写权限" in state.log[-1].text
+    assert "alice" in (state.notice or "")
+
+
+def test_mapping_rejected_event_survives_missing_fields() -> None:
+    """缺字段（老版本服务端或日志被裁剪）只该退化成默认值，不该把界面搞崩。"""
+    state = apply_server_event(ServerState(), EventType.MAPPING_REJECTED)
+    assert state.log[-1].level == "warn"
+    assert ANONYMOUS_IDENTITY in state.log[-1].text
+
+
 def test_request_end_produces_no_log_on_purpose() -> None:
     """服务端的 REQUEST_END **没有**成功标志字段，写不出有信息量的日志。
 
