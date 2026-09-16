@@ -34,9 +34,9 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
-from config import ConfigError, LimitsConfig, ServerConfig
+from config import ConfigError, LimitsConfig, MappingRule, ServerConfig
 from localtonet.core.dispatcher import MessageDispatcher, handler
 from localtonet.core.events import EventBus, EventType
 from localtonet.core.heartbeat import Watchdog
@@ -294,6 +294,7 @@ class TunnelServer:
         """一次性拿全服务端状态。GUI 表格、健康检查都可以直接用这个。"""
         return {
             "name": self._config.name,
+            "auth": self._auth.name,
             "clients": self._registry.snapshot(),
             "port_owner": self._registry.port_owner_snapshot(),
             "mapping": [rule.to_dict() for rule in self._mapping.rules()],
@@ -301,6 +302,21 @@ class TunnelServer:
             "pending": len(self._pending),
             "stats": self._stats.to_dict(),
         }
+
+    async def submit_mapping(self, rules: Sequence[MappingRule]) -> MappingDiff:
+        """应用一份映射表，并把新表广播给所有在线客户端，返回本次差异。
+
+        这是**管理台唯一的写入口**，与 ``set_mapping`` 指令共用同一段内核
+        （``MappingManager.apply`` → ``_broadcast_mapping_list``）。
+        刻意不复制第二份实现：两个入口若各写一遍，迟早出现"走指令能改、走管理台改不动"
+        这类只在一条路径上复现的 bug。
+
+        调用者必须已经在事件循环里（界面侧走 ``LoopThread.submit``）。
+        校验失败抛 :class:`ConfigError`/:class:`TunnelError`，由调用方决定怎么呈现。
+        """
+        diff = await self._mapping.apply(rules)
+        await self._broadcast_mapping_list()
+        return diff
 
     # ------------------------------------------------------------------ #
     # 控制通道
@@ -594,7 +610,8 @@ class TunnelServer:
 
         try:
             rules = parse_mapping(raw)
-            diff = await self._mapping.apply(rules)
+            # 与管理台共用同一内核（apply + 广播），校验也走同一份 parse_mapping
+            diff = await self.submit_mapping(rules)
         except (ConfigError, TunnelError) as exc:
             self._log.warning("客户端 %s 提交的映射更新被拒绝：%s", session.client_id, exc)
             # 回执里用 exc.message（不带 [code] 前缀），只有日志才用 str(exc)——
@@ -606,7 +623,6 @@ class TunnelServer:
             session,
             make_msg(MsgType.MAPPING_RESULT, ok=True, msg=diff.describe(), diff=diff.to_dict()),
         )
-        await self._broadcast_mapping_list()
 
     # ------------------------------------------------------------------ #
     # 数据通道

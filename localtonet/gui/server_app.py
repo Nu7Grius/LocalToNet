@@ -1,24 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-localtonet.gui.app —— 客户端 tkinter 界面
-==========================================
-界面只负责**画**和**收事件**：
+localtonet.gui.server_app —— 服务端管理台的 tkinter 窗口
+========================================================
+版式：工具栏 → 在线客户端（只读）→ 映射表（可编辑）→ 事件日志 → 状态栏。
 
-* 每 100ms 把 :class:`localtonet.gui.bridge.UiBridge` 里的消息倒给
-  :class:`localtonet.gui.viewmodel.GuiViewModel`，再把结果画出来；
-* 按钮点了什么，就调 :class:`localtonet.gui.controller.GuiController` 的哪个方法。
+与客户端界面（:mod:`localtonet.gui.app`）的三处差别，都是**服务端视角**决定的：
 
-映射的增删改查**没有一行业务逻辑在这里**——校验走
-:func:`localtonet.core.rules.parse_mapping`（与服务端同一个函数），
-提交走 :meth:`TunnelClient.set_mapping`。界面坏了顶多是看不清，
-绝不会出现"界面说没问题、服务端报错"这种两边规则不一致的怪事。
+1. **多一张只读的"在线客户端"表**。客户端界面只看得到自己，服务端才看得到
+   "谁连上来了、身份是谁、认领了哪些端口"。这是本轮管理台存在的首要理由——
+   在此之前服务端是个黑盒，只有一行行日志。
+2. **生命周期按钮是"启动/停止服务端"**，不是"连接/断开"。
+   客户端界面停掉的是自己；管理台停掉的是**运维正在托管的东西**（见 server_controller）。
+3. **映射表提交后生效的范围是所有人**。客户端提交只影响自己认领的端口；
+   管理台改的是服务端映射表，改完会广播给所有在线客户端，它们的界面会跟着变。
 
-日志面板、编辑对话框、颜色常量这类"两个界面都要用"的东西在
-:mod:`localtonet.gui.widgets`；本模块只管客户端自己的版式。
+铁律照旧：**别在这里等异步结果**。按钮只投协程，结果由邮筒回传。
 
-界面线程与事件循环的边界见 :mod:`localtonet.gui.bridge`；这里只需要记住一条铁律：
-**别在这里等异步结果**（不要对 ``concurrent.futures.Future`` 调 ``.result()``），
-一等就会把整个窗口冻住。
+在线客户端表**没有任何写操作**（不做"踢人"）：一个误点的踢人按钮会把正在
+服务的隧道掐断，而本轮没有做权限模型——远端管理不该只有"点一下"的门槛。
 """
 
 from __future__ import annotations
@@ -30,11 +29,12 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Any, Dict, Optional
 
-from config import ClientConfig, ConfigError
+from config import ConfigError, ServerConfig
 from localtonet.gui.bridge import LoopThread, UiBridge
-from localtonet.gui.controller import GuiController
 from localtonet.gui.model import MappingRow, describe_tls
-from localtonet.gui.viewmodel import GuiViewModel
+from localtonet.gui.server_controller import ServerController
+from localtonet.gui.server_model import ClientRow
+from localtonet.gui.server_viewmodel import ServerViewModel
 from localtonet.gui.widgets import (
     DIRTY_TAG_BG,
     PUMP_INTERVAL_MS,
@@ -43,47 +43,45 @@ from localtonet.gui.widgets import (
 )
 from logging_setup import get_logger
 
-__all__ = ["TunnelGuiApp", "PUMP_INTERVAL_MS"]
+__all__ = ["ServerGuiApp"]
 
 
-class TunnelGuiApp:
-    """内网穿透客户端的图形外壳。"""
+class ServerGuiApp:
+    """内网穿透服务端的本地管理台。"""
 
     def __init__(
         self,
-        config: ClientConfig,
+        config: ServerConfig,
         *,
         autostart: bool = True,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._config = config
-        self._log = logger or get_logger("gui.app")
+        self._log = logger or get_logger("gui.server_app")
         self._closed = False
         self._after_id: Optional[str] = None
-        self._table_signature: Optional[tuple] = None
+        self._client_signature: Optional[Any] = None
+        self._table_signature: Optional[Any] = None
         self._rendered_log_total = 0
         self._want_running = False
-        """界面上"用户希望客户端处于运行状态"的意图。
+        """界面上"用户希望服务端处于运行状态"的意图。
 
-        按钮可用性用它而不是去读客户端内部字段：那是另一个线程正在改的对象，
-        跨线程读它属于数据竞争。真实状态仍由 ``snapshot()`` 通过邮筒回传，
-        两者短暂不一致时以快照为准（例如鉴权失败后客户端自行停止）。
+        按钮可用性用它而不是去读 ``controller.running``：那是另一个线程正在改的字段，
+        跨线程读它属于数据竞争。真实状态由 ``snapshot()`` 通过邮筒回传。
         """
 
-        self._loop_thread = LoopThread().start()
+        self._loop_thread = LoopThread(name="localtonet-server-gui-loop").start()
         self._bridge = UiBridge()
-        self._controller = GuiController(config, loop_thread=self._loop_thread, bridge=self._bridge)
-        self._vm = GuiViewModel(
-            default_local_port=config.local_ports[0] if config.local_ports else 8000,
-            default_local_host=config.local_host,
-        )
+        self._controller = ServerController(config, loop_thread=self._loop_thread, bridge=self._bridge)
+        self._vm = ServerViewModel(idle_timeout=config.timeouts.client_idle_timeout)
 
         self._root = tk.Tk()
-        self._root.title(f"LocalToNet 客户端 · {config.client_id or '自动标识'}")
-        self._root.geometry("980x620")
-        self._root.minsize(820, 520)
+        self._root.title(f"LocalToNet 管理台 · {config.name}")
+        self._root.geometry("1080x760")
+        self._root.minsize(900, 620)
 
         self._build_toolbar()
+        self._build_clients()
         self._build_table()
         self._build_log()
         self._build_statusbar()
@@ -93,7 +91,7 @@ class TunnelGuiApp:
         self._pump()
 
         if autostart:
-            self._root.after(200, self._on_connect)
+            self._root.after(200, self._on_start)
 
     # ------------------------------------------------------------------ #
     # 界面搭建
@@ -105,25 +103,43 @@ class TunnelGuiApp:
 
         self._buttons: Dict[str, ttk.Button] = {}
 
-        def add(key: str, text: str, command) -> None:
-            button = ttk.Button(bar, text=text, command=command, width=12)
+        def add(key: str, text: str, command, width: int = 13) -> None:
+            button = ttk.Button(bar, text=text, command=command, width=width)
             button.pack(side=tk.LEFT, padx=2)
             self._buttons[key] = button
 
-        add("connect", "连接", self._on_connect)
-        add("disconnect", "断开", self._on_disconnect)
+        add("start", "启动服务端", self._on_start)
+        add("stop", "停止服务端", self._on_stop)
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
         add("add", "新增映射", self._on_add)
-        add("duplicate", "复制", self._on_duplicate)
-        add("remove", "删除", self._on_remove)
+        add("duplicate", "复制", self._on_duplicate, width=8)
+        add("remove", "删除", self._on_remove, width=8)
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
-        add("submit", "提交", self._on_submit)
+        add("submit", "提交映射", self._on_submit)
         add("revert", "放弃修改", self._on_revert)
 
-        ttk.Label(bar, text="（双击任意一行即可编辑）", foreground="#666666").pack(side=tk.LEFT, padx=8)
+        ttk.Label(bar, text="（双击映射表任意一行即可编辑）", foreground="#666666").pack(side=tk.LEFT, padx=8)
+
+    def _build_clients(self) -> None:
+        frame = ttk.LabelFrame(self._root, text="在线客户端", padding=8)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+
+        # 列序与 ClientRow.as_cells() 一致
+        columns = ("identity", "client_id", "peer", "ports", "online", "idle")
+        widths = (140, 160, 180, 220, 100, 120)
+
+        self._clients = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse", height=6)
+        for column, heading, width in zip(columns, ClientRow.COLUMNS, widths):
+            self._clients.heading(column, text=heading)
+            self._clients.column(column, width=width, anchor=tk.W, stretch=(column == "ports"))
+
+        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self._clients.yview)
+        self._clients.configure(yscrollcommand=scrollbar.set)
+        self._clients.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
     def _build_table(self) -> None:
-        frame = ttk.LabelFrame(self._root, text="映射表（公网端口 → 内网端口）", padding=8)
+        frame = ttk.LabelFrame(self._root, text="映射表（公网端口 → 内网端口，提交后对所有客户端生效）", padding=8)
         frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
 
         # 列顺序必须与 MappingRow.as_cells() 一致（外加末尾的"状态"列）
@@ -144,7 +160,7 @@ class TunnelGuiApp:
         self._tree.bind("<Double-1>", self._on_row_double_click)
 
     def _build_log(self) -> None:
-        self._log_view = build_log_panel(self._root, height=10)
+        self._log_view = build_log_panel(self._root, height=9)
 
     def _build_statusbar(self) -> None:
         self._status_var = tk.StringVar(value="就绪")
@@ -170,10 +186,28 @@ class TunnelGuiApp:
         self._after_id = self._root.after(PUMP_INTERVAL_MS, self._pump)
 
     def _render(self) -> None:
+        self._render_clients()
         self._render_table()
         self._render_log()
         self._render_buttons()
         self._status_var.set(self._vm.status_line() + (f"　|　{self._vm.notice}" if self._vm.notice else ""))
+
+    def _render_clients(self) -> None:
+        state = self._vm.state
+        rows = state.clients
+        signature = tuple(row.as_cells(idle_timeout=state.idle_timeout) for row in rows)
+        if signature == self._client_signature:
+            return
+        self._client_signature = signature
+
+        self._clients.delete(*self._clients.get_children())
+        for index, row in enumerate(rows):
+            self._clients.insert(
+                "",
+                tk.END,
+                iid=str(index),
+                values=row.as_cells(idle_timeout=state.idle_timeout),
+            )
 
     def _render_table(self) -> None:
         table = self._vm.table
@@ -222,39 +256,44 @@ class TunnelGuiApp:
         self._log_view.configure(state=tk.DISABLED)
 
     def _render_buttons(self) -> None:
-        state = self._vm.state
         table = self._vm.table
-        running = self._want_running and not state.fatal
+        running = self._want_running
         has_selection = self._selected_index() is not None
 
-        self._buttons["connect"].configure(state=tk.DISABLED if running else tk.NORMAL)
-        self._buttons["disconnect"].configure(state=tk.NORMAL if running else tk.DISABLED)
-        self._buttons["submit"].configure(
-            state=tk.NORMAL if (table.is_dirty and state.online and not state.fatal) else tk.DISABLED
-        )
+        self._buttons["start"].configure(state=tk.DISABLED if running else tk.NORMAL)
+        self._buttons["stop"].configure(state=tk.NORMAL if running else tk.DISABLED)
+        # 提交必须等服务端真的在跑：映射表的 apply() 要起监听，
+        # 在没启动的服务端上提交会得到一份"监听已起但控制通道没开"的半截状态
+        self._buttons["submit"].configure(state=tk.NORMAL if (table.is_dirty and running) else tk.DISABLED)
         self._buttons["revert"].configure(state=tk.NORMAL if table.is_dirty else tk.DISABLED)
         self._buttons["add"].configure(state=tk.NORMAL)
         for key in ("duplicate", "remove"):
             self._buttons[key].configure(state=tk.NORMAL if has_selection else tk.DISABLED)
 
     # ------------------------------------------------------------------ #
-    # 动作：连接
+    # 动作：生命周期
     # ------------------------------------------------------------------ #
 
-    def _on_connect(self) -> None:
-        if self._want_running and not self._vm.state.fatal:
-            self._notice("info", "客户端已在运行")
+    def _on_start(self) -> None:
+        if self._want_running:
+            self._notice("info", "服务端已在运行")
             return
         self._want_running = True
-        self._notice("info", "正在连接服务端…")
-        self._submit_coroutine(self._controller.start(), "启动客户端")
+        self._notice("info", "正在启动服务端…")
+        self._submit_coroutine(self._controller.start(), "启动服务端")
 
-    def _on_disconnect(self) -> None:
+    def _on_stop(self) -> None:
         if not self._want_running:
-            self._notice("info", "客户端本来就未运行")
+            self._notice("info", "服务端本来就未运行")
+            return
+        if not messagebox.askyesno(
+            "确认停止",
+            "停止服务端会断开所有在线客户端、关闭全部访客端口。\n确定要停止吗？",
+        ):
             return
         self._want_running = False
-        self._submit_coroutine(self._controller.stop(), "停止客户端")
+        self._notice("info", "正在停止服务端…")
+        self._submit_coroutine(self._controller.stop(), "停止服务端")
 
     # ------------------------------------------------------------------ #
     # 动作：映射表编辑
@@ -263,10 +302,10 @@ class TunnelGuiApp:
     def _on_add(self) -> None:
         draft = MappingRow(
             public_port=self._vm.table.next_free_public_port(),
-            local_port=self._config.local_ports[0] if self._config.local_ports else 8000,
-            local_host=self._config.local_host,
+            local_port=self._default_local_port(),
+            local_host=self._default_local_host(),
         )
-        values = self._ask_row("新增映射", draft)
+        values = ask_mapping_row(self._root, "新增映射", draft)
         if values is None:
             return
         self._mutate(lambda: self._vm.table.add_row(**values), "新增")
@@ -297,7 +336,7 @@ class TunnelGuiApp:
         row = self._vm.table.row(index)
         if row is None:
             return
-        values = self._ask_row(f"编辑映射 {row.describe()}", row)
+        values = ask_mapping_row(self._root, f"编辑映射 {row.describe()}", row)
         if values is None:
             return
         self._mutate(lambda: self._vm.table.update_row(index, **values), "修改")
@@ -313,12 +352,12 @@ class TunnelGuiApp:
 
     def _on_submit(self) -> None:
         try:
-            rules = self._vm.table.rules()  # 本地先过一遍，与服务器同一条规则
+            rules = self._vm.table.rules()  # 本地先过一遍，与服务端同一条规则
         except ConfigError as exc:
             self._notice("error", f"映射不合法：{exc}")
             return
-        if not self._vm.state.online:
-            self._notice("warn", "尚未连接服务端，无法提交")
+        if not self._want_running:
+            self._notice("warn", "服务端未运行，无法提交")
             return
         self._notice("info", f"正在提交 {len(rules)} 条映射…")
         self._submit_coroutine(self._controller.submit_mapping(rules), "提交映射")
@@ -330,7 +369,7 @@ class TunnelGuiApp:
     def _submit_coroutine(self, coro: Any, what: str) -> None:
         """把协程交给后台事件循环，**不在这里等结果**。
 
-        结果通过邮筒回来（事件、回执），异常在回调里变成一条日志。
+        结果通过邮筒回来（事件、快照、提交结果），异常在回调里变成一条日志。
         在界面线程等异步结果会把窗口冻住，这是 tkinter + asyncio 最常见的死法。
         """
         try:
@@ -354,6 +393,19 @@ class TunnelGuiApp:
     # 辅助
     # ------------------------------------------------------------------ #
 
+    def _default_local_port(self) -> int:
+        """新增映射时的默认内网端口：沿用服务端当前第一条规则，没有就给 8000。
+
+        服务端配置里没有"客户端认领哪些内网端口"的概念（那是客户端自己的事），
+        所以这里只能从已有映射里猜一个合理的起点。
+        """
+        rows = self._vm.table.rows
+        return rows[0].local_port if rows else 8000
+
+    def _default_local_host(self) -> str:
+        rows = self._vm.table.rows
+        return rows[0].local_host if rows else "127.0.0.1"
+
     def _mutate(self, action, verb: str) -> None:
         """执行一次表格编辑，把校验失败原样显示给用户。"""
         try:
@@ -362,7 +414,7 @@ class TunnelGuiApp:
             self._notice("error", f"{verb}失败：{exc}")
             return
         self._table_signature = None  # 强制重绘
-        self._notice("info", f"已{verb}（还没提交，点“提交”后生效）")
+        self._notice("info", f"已{verb}（还没提交，点“提交映射”后生效）")
         self._render()
 
     def _index_at_event(self, event: Any) -> Optional[int]:
@@ -389,10 +441,6 @@ class TunnelGuiApp:
         self._vm.apply(("local", {"level": level, "text": text}))
         self._render()
 
-    def _ask_row(self, title: str, initial: MappingRow) -> Optional[Dict[str, Any]]:
-        """弹出编辑对话框。实现共享在 :mod:`localtonet.gui.widgets`，这里只转发。"""
-        return ask_mapping_row(self._root, title, initial)
-
     # ------------------------------------------------------------------ #
     # 生命周期
     # ------------------------------------------------------------------ #
@@ -403,7 +451,7 @@ class TunnelGuiApp:
         return 0
 
     def close(self) -> None:
-        """关窗口：停掉后台循环并释放资源。重复调用安全。"""
+        """关窗口：停掉服务端与后台循环。重复调用安全。"""
         if self._closed:
             return
         self._closed = True
@@ -414,7 +462,8 @@ class TunnelGuiApp:
                 pass
             self._after_id = None
 
-        # 不等结果：关窗口时用户要的是"立刻关掉"，残留任务由 LoopThread.stop 取消。
+        # 不等结果：关窗口时用户要的是"立刻关掉"。
+        # 服务端的访客端口由 stop() 关闭，LoopThread.stop 只负责取消残留任务。
         with contextlib.suppress(Exception):
             self._loop_thread.submit(self._controller.stop())
         self._bridge.close()
@@ -423,9 +472,9 @@ class TunnelGuiApp:
             self._root.destroy()
         except tk.TclError:  # pragma: no cover
             pass
-        self._log.info("界面已关闭")
+        self._log.info("管理台已关闭")
 
 
-def create_app(config: ClientConfig, **kwargs: Any) -> TunnelGuiApp:
-    """构造并返回界面应用（供 :func:`localtonet.gui.create_app` 调用）。"""
-    return TunnelGuiApp(config, **kwargs)
+def create_server_app(config: ServerConfig, **kwargs: Any) -> ServerGuiApp:
+    """构造并返回管理台应用（供 :func:`localtonet.gui.create_server_app` 调用）。"""
+    return ServerGuiApp(config, **kwargs)

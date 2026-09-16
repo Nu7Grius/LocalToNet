@@ -42,6 +42,8 @@ __all__ = [
     "append_log",
     "apply_event",
     "describe_tls",
+    "fmt_bytes",
+    "fmt_ports",
     "note_mapping_result",
 ]
 MAX_LOG_ENTRIES = 500
@@ -474,24 +476,24 @@ class GuiState:
             f"状态 {self.connection}",
             f"客户端 {self.client_id or '-'}",
             f"服务端 {self.server or '-'}",
-            f"认领 {_fmt_ports(self.claimed)}",
+            f"认领 {fmt_ports(self.claimed)}",
             f"活跃转发 {self.active_forwards}",
             f"请求 {self.stat('forwards_total')}（失败 {self.stat('forwards_failed')}）",
-            f"上行 {_fmt_bytes(self.stat('bytes_upload'))} / 下行 {_fmt_bytes(self.stat('bytes_download'))}",
+            f"上行 {fmt_bytes(self.stat('bytes_upload'))} / 下行 {fmt_bytes(self.stat('bytes_download'))}",
             f"重连 {self.stat('reconnects')}",
         ]
         if self.conflicts:
-            parts.append(f"端口冲突 {_fmt_ports(self.conflicts)}")
+            parts.append(f"端口冲突 {fmt_ports(self.conflicts)}")
         if self.fatal:
             parts.append("已停止重试（鉴权失败）")
         return " ｜ ".join(parts)
 
 
-def _fmt_ports(ports: Sequence[int]) -> str:
+def fmt_ports(ports: Sequence[int]) -> str:
     return ",".join(str(port) for port in ports) if ports else "无"
 
 
-def _fmt_bytes(size: int) -> str:
+def fmt_bytes(size: int) -> str:
     value = float(size)
     for unit in ("B", "KB", "MB"):
         if value < 1024:
@@ -513,10 +515,10 @@ class _Outcome:
 
 
 def _describe(claimed: Any, conflicts: Any) -> str:
-    text = f"认领端口 {_fmt_ports([p for p in claimed or [] if isinstance(p, int)])}"
+    text = f"认领端口 {fmt_ports([p for p in claimed or [] if isinstance(p, int)])}"
     conflicts_list = [p for p in conflicts or [] if isinstance(p, int)]
     if conflicts_list:
-        text += f"，冲突被拒 {_fmt_ports(conflicts_list)}"
+        text += f"，冲突被拒 {fmt_ports(conflicts_list)}"
     return text
 
 
@@ -534,7 +536,7 @@ def _on_client_registered(payload: Mapping[str, Any]) -> _Outcome:
     logs = [("ok", f"注册成功：{_describe(payload.get('claimed'), payload.get('conflicts'))}")]
     conflicts = [p for p in payload.get("conflicts") or [] if isinstance(p, int)]
     if conflicts:
-        logs.append(("warn", f"以下端口已被其他客户端占用，本次未认领：{_fmt_ports(conflicts)}"))
+        logs.append(("warn", f"以下端口已被其他客户端占用，本次未认领：{fmt_ports(conflicts)}"))
     return _Outcome(logs=tuple(logs), notice=f"在线：{_describe(payload.get('claimed'), payload.get('conflicts'))}")
 
 

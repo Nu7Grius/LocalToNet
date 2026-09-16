@@ -14,6 +14,9 @@
 - **多客户端端口独占**：一个客户端认领的端口，流量只会派给它
 - **动态映射**：运行期增删映射端口，服务端即时停/起监听
 - **图形界面（可选）**：`gui.py` 可视化编辑映射表，提交即生效，不必改 JSON、不必重启进程
+- **服务端管理台**：`server_gui.py` 看得到**在线客户端**（身份 / 对端地址 / 认领的内网端口 /
+  在线与空闲时长），也能可视化编辑服务端映射表，提交后立即起停访客端口并广播给所有客户端。
+  同进程、不动协议，服务端从此不再是黑盒
 - **双保险保活**：客户端心跳探测 + 服务端失联看门狗
 - **指数退避重连**：1s → 2s → 4s → … → 60s 封顶，成功即归零
 - **明确错误语义**：404 / 502 兜底，绝不留下"空回复"
@@ -35,7 +38,7 @@
 ```
 ┌─────────────┐        ┌──────────────────────────────┐        ┌──────────────────┐
 │  公网访客    │        │        公网服务器             │        │   内网客户端      │
-│ 浏览器/curl  │        │         server.py            │        │ client.py/gui.py │
+│ 浏览器/curl  │        │    server.py/server_gui.py    │        │ client.py/gui.py │
 └──────┬──────┘        └───────────────┬──────────────┘        └────────┬─────────┘
        │                               │                                │
        │  9028（访客端口，按映射）       │                                │
@@ -68,8 +71,9 @@
 # 终端 1：内网后端（演示服务，实际使用时换成你自己的服务）
 python examples/demo_backend.py --port 8000
 
-# 终端 2：服务端（公网机器上运行）
-python server.py
+# 终端 2（二选一）：
+python server.py            # 命令行服务端
+python server_gui.py        # 服务端管理台（图形界面，见「图形界面」一节）
 
 # 终端 3（二选一）：
 python client.py --server 127.0.0.1 --local-ports 8000   # 命令行
@@ -90,8 +94,9 @@ python server.py --mapping 9028:8000 --mapping 9030:8080 --log-level DEBUG
 python client.py --server 1.2.3.4:7000 --local-ports 8000,8080 --client-id my-pc
 ```
 
-`gui.py` 的参数与 `client.py` **完全一致**（同一套解析函数），另外多一个
-`--no-autostart`：打开界面但不自动连接。界面里能做的事见下面「图形界面」一节。
+`gui.py` 的参数与 `client.py` **完全一致**（同一套解析函数），`server_gui.py`
+的参数与 `server.py` **完全一致**；两者都多一个 `--no-autostart`：打开窗口但不自动连接/启动。
+界面里能做的事见下面「图形界面」一节。
 
 配置优先级：**默认值 < JSON 文件 < 环境变量（`LOCALTONET_` 前缀）< 命令行参数**。
 
@@ -467,7 +472,8 @@ LocalToNet/
 ├── config.json               服务端配置示例
 ├── client.json               客户端配置示例
 ├── server.py / client.py     命令行入口
-├── gui.py                    图形界面入口（参数与 client.py 共用）
+├── gui.py                    客户端图形界面入口（参数与 client.py 共用）
+├── server_gui.py             服务端管理台入口（参数与 server.py 共用）
 ├── localtonet/
 │   ├── errors.py             业务异常（带 code，用于映射 HTTP 状态码）
 │   ├── core/                 两端共用基础设施
@@ -490,14 +496,19 @@ LocalToNet/
 │   ├── client/               客户端
 │   │   ├── core.py           控制长连接、心跳、重连
 │   │   └── forwarder.py      数据通道 + 内网后端连接
-│   └── gui/                  图形界面（tkinter 只出现在 app.py）
-│       ├── model.py          映射表编辑缓冲区 + 界面状态（纯逻辑）
-│       ├── bridge.py         asyncio 线程 ↔ tkinter 线程的桥
+│   └── gui/                  图形界面（tkinter 只出现在 *_app.py 与 widgets.py）
+│       ├── model.py          客户端：映射表编辑缓冲区 + 界面状态（纯逻辑）
+│       ├── bridge.py         asyncio 线程 ↔ tkinter 线程的桥（两端共用）
 │       ├── controller.py     拉起客户端、订阅事件、提交映射
-│       ├── viewmodel.py      邮筒消息 → 表格与状态栏（纯逻辑）
-│       └── app.py            窗口、表格、按钮、状态栏、日志面板
+│       ├── viewmodel.py      客户端：邮筒消息 → 表格与状态栏（纯逻辑）
+│       ├── server_model.py   管理台：在线客户端行 + 管理台状态（纯逻辑）
+│       ├── server_controller.py  拉起/关停服务端、订阅事件、提交映射
+│       ├── server_viewmodel.py   管理台：邮筒消息 → 在线表与映射表（纯逻辑）
+│       ├── widgets.py        两个界面共用的构件（日志面板、编辑对话框、颜色）
+│       ├── app.py            客户端窗口
+│       └── server_app.py     管理台窗口（在线客户端表 + 映射表）
 ├── examples/demo_backend.py  演示用内网 HTTP 服务
-└── tests/                    335 项测试（单测 + 端到端 + GUI + 命令行 + 鉴权 + TLS + 访客端 TLS）
+└── tests/                    374 项测试（单测 + 端到端 + 双端 GUI + 命令行 + 鉴权 + TLS + 访客端 TLS）
 ```
 
 ## 协议
@@ -583,6 +594,13 @@ LocalToNet/
 
 ## 图形界面
 
+两个界面：**客户端界面**（`gui.py`，内网侧）与**服务端管理台**（`server_gui.py`，公网侧）。
+两者共用同一套分层——纯逻辑的 model / 跨线程的 bridge / 编排的 controller。
+tkinter 只允许出现在 `gui/app.py`、`gui/server_app.py` 与 `gui/widgets.py`，
+`gui/__init__.py` 不 import 它们，所以没有 tkinter 的机器上核心包照常可用。
+
+### 客户端界面（`gui.py`）
+
 ```bash
 python gui.py                                  # 用 client.json + 自动连接
 python gui.py --server 1.2.3.4:7000 --local-ports 8000 --token <令牌>
@@ -626,11 +644,63 @@ tkinter 的控件调用必须留在主线程，而 asyncio 的循环一旦跑起
 界面就**保留用户输入**，只更新"已保存"快照并提示"远端已更新"。静默覆盖用户
 正在敲的内容是最伤人的交互之一。
 
-**无界面环境照常可用**：`localtonet/gui/__init__.py` 不 import `app`，
+**无界面环境照常可用**：`localtonet/gui/__init__.py` 不 import 任何 `*_app` 模块，
 因此没有 tkinter 的机器上 `import localtonet.gui` 依然成功，服务端与命令行客户端
-完全不受影响（有一条子进程测试把 `tkinter` 从 `sys.modules` 里挖掉来实测这一点）。
+完全不受影响（有两条子进程测试把 `tkinter` 从 `sys.modules` 里挖掉来实测这一点）。
 只有真的要开窗口时才会给出可读提示并以退出码 2 结束。
 Linux 上若缺 tkinter，安装系统包 `python3-tk` 即可（Windows/macOS 官方发行版自带）。
+
+### 服务端管理台（`server_gui.py`）
+
+```bash
+python server_gui.py                                # 读 config.json 并自动启动服务端
+python server_gui.py --mapping 9028:8000 --token <令牌>
+python server_gui.py --auth-file tokens.json        # 令牌表鉴权
+python server_gui.py --no-autostart                 # 只开窗口，先看配置再启动
+```
+
+在管理台出现之前，服务端是一个**只有日志的黑盒**：谁连上来了、身份是什么、
+占了哪些端口、被拒了几次，全都得靠翻日志。管理台把这些直接画出来：
+
+| 区域 | 内容 |
+| --- | --- |
+| 在线客户端（只读） | 身份、客户端 ID、对端地址、认领的内网端口、在线时长、空闲时长；空闲达到看门狗阈值会标「将失联」 |
+| 映射表（可编辑） | 与客户端界面同一套增删改查与三态「访客 TLS」；提交后立即起停访客端口，**并广播给所有在线客户端** |
+| 状态栏 | 服务端名、鉴权模式、在线数、监听端口、挂起通道、注册/被拒计数、请求与失败计数、上下行字节、限速累计等待 |
+| 事件日志 | 启动/停止、客户端上线下线（含身份）、转发失败原因；请求完成刻意不记，见下 |
+
+三个值得说明的设计：
+
+**1. 同进程、不动协议。** 管理台就贴在服务端进程里，直接读 `TunnelServer.snapshot()`、
+直接调 `TunnelServer.submit_mapping()`。于是本轮**一行协议都没改**——
+不需要新指令，也不需要为"谁能管理服务端"再造一套权限模型。
+
+**2. 写入口只有一个。** 管理台的"提交映射"与客户端的 `set_mapping` 指令**共用同一段内核**
+（`MappingManager.apply()` → `_broadcast_mapping_list()`，见 `TunnelServer.submit_mapping`）。
+两个入口各写一遍的后果很具体：迟早出现"走客户端能改、走管理台改不动"这类只在一条路径上复现的缺陷。
+
+**3. 映射表靠快照同步，不靠事件。**
+
+```
+主线程（tkinter）                          工作线程（asyncio）
+App ──root.after(100ms)──► drain()  ◄── queue ◄── EventBus 订阅者
+ └── LoopThread.submit(coro) ──────────► server.start() / serve_forever() / stop() / submit_mapping()
+```
+
+客户端靠 `MAPPING_CHANGED` 事件刷新映射表，而**服务端根本不发这个事件**
+（它只在启动/增删映射时 emit，且映射表的权威来源是 `snapshot()["mapping"]`）。
+所以"远端映射变了"在管理台这里变成了"两次采样之间指纹不同"。既然采样每 0.5 秒一次，
+就不能每次采样都喊一句"服务端映射表已更新"——界面记住上一份指纹，
+只在**真的变了**并且用户正在编辑时才提示，其余时候安静地保留用户输入。
+
+**生命周期是刻意绑定的**：关掉窗口 = 服务端下线（访客端口全部关闭）。
+要长时间托管请用 `server.py`；"服务端继续跑、窗口在另一台机器上开"是**远程管理**，
+需要协议扩展与权限模型，不在本轮范围。停止之后可以再次启动——会**新建一个
+`TunnelServer` 实例**，而不是拿旧实例假装重启（旧实例的 `_stopped` 已置位，
+再 `serve_forever()` 会立刻返回，得到一个"看着活着其实不干活"的服务端）。
+
+**在线客户端表没有任何写操作**：本轮不做"踢人"。在没有权限模型的前提下，
+一个误点的按钮就能掐断正在服务的隧道；要做也应该先把"谁能管理"定义清楚。
 
 ## 扩展点
 
@@ -644,14 +714,18 @@ Linux 上若缺 tkinter，安装系统包 `python3-tk` 即可（Windows/macOS �
 | 端口路由策略 | `ClientRegistry(routing=...)` | 归属优先 → 首个在线 | 轮询 / 加权 / 标签路由 |
 | 映射持久化 | `server.mapping.MappingStore` | 内存 / JSON 文件（原子写） | SQLite / Redis |
 | 映射校验规则 | `core.rules.parse_mapping` | 服务端与 GUI 共用一份 | 增删规则只改这一处 |
-| 界面与观测 | `core.events.EventBus` | tkinter GUI + 结构化日志 | Web 界面 / Prometheus |
+| 映射写入口 | `server.core.TunnelServer.submit_mapping` | `set_mapping` 指令与管理台共用同一段内核 | 新增写入口零分叉 |
+| 界面与观测 | `core.events.EventBus` | tkinter 双端界面（客户端 + 管理台）+ 结构化日志 | Web 界面 / Prometheus |
+| 管理台的会话层 | `gui.server_controller.ServerController` | 同进程持有服务端，`LoopThread` + 邮筒 | 远程管理（需协议扩展 + 管理权限模型） |
 | 限流配额 | `core.pipe.RateLimitHook` | `ClientRateLimiter`（令牌桶，按客户端 × 方向） | 加权公平队列 / 按端口限速 |
 | 传输加密 | 建立连接处 | 明文 / TLS（`core.tls` 建上下文），控制+数据+访客三跳各自可选 | 会话密钥 / 换 TLS 库 |
 | 超时参数 | `config.Timeouts` | 集中默认值 | 环境变量 / 运行时可调 |
 
 事件总线已预留 `REQUEST_START` / `REQUEST_END` / `CONN_ERROR` / `MAPPING_CHANGED` 等事件，
-GUI 已经挂上去（见 `localtonet/gui/controller.py` 的订阅白名单），加指标系统同理，核心链路无需改动。
-客户端 `TunnelClient.set_mapping()` 封装了"提交映射并等待回执"的语义，界面表格的提交按钮直接调它。
+两端界面都已挂上去（见 `localtonet/gui/controller.py` 与 `localtonet/gui/server_controller.py`
+的订阅白名单），加指标系统同理，核心链路无需改动。
+客户端 `TunnelClient.set_mapping()` 封装了"提交映射并等待回执"的语义、服务端
+`TunnelServer.submit_mapping()` 封装了"应用映射并广播"，两个界面表格的提交按钮直接调它们。
 
 ## 测试
 
@@ -660,9 +734,10 @@ python -m pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-当前 **335 项全部通过**（test_config 63 / test_gui_model 50 / test_core 40 / test_auth_tokens 36 /
-test_server_cli 29 / test_e2e 21 / test_mapping_store 21 / test_protocol 17 / test_visitor_tls 13 /
-test_limiter 12 / test_gui_bridge 10 / test_tls 10 / test_client_cli 7 / test_gui_controller 6），
+当前 **374 项全部通过**（test_config 63 / test_gui_model 50 / test_core 40 / test_auth_tokens 36 /
+test_gui_server_model 29 / test_server_cli 29 / test_e2e 21 / test_mapping_store 21 /
+test_protocol 17 / test_visitor_tls 13 / test_limiter 12 / test_gui_bridge 10 /
+test_gui_server_controller 10 / test_tls 10 / test_client_cli 7 / test_gui_controller 6），
 其中 21 项是真实拉起三件套、走真实 TCP 的端到端测试：
 
 | 用例 | 验证内容 |
@@ -740,21 +815,40 @@ TLS 访客打明文端口都必须拿不到数据，否则"配置里多了几个
 上行与下行必须写向**对侧**，写成 `a_reader → a_writer` 就成了原地回环，
 表面上"日志里有流量"，对端却永远收不到。
 
-GUI 相关的三项测试（`test_gui_model` / `test_gui_bridge` / `test_gui_controller`）
-覆盖的都是"不需要显示器也能验"的部分：映射表编辑与校验、服务端推送与用户编辑的冲突策略、
-后台事件循环里的真实 TCP I/O、以及界面提交映射的完整链路（真实后端 + 真实服务端 + 真客户端，
-提交后新端口真的能被 `curl` 到、删掉后真的不再监听）。
-窗口本身（`app.py`）不做自动化测试——它需要显示器，改版式也不该影响这些断言。
+GUI 相关的五组测试（`test_gui_model` / `test_gui_bridge` / `test_gui_controller` /
+`test_gui_server_model` / `test_gui_server_controller`）覆盖的都是"不需要显示器也能验"的部分：
+映射表编辑与校验、服务端推送与用户编辑的冲突策略、后台事件循环里的真实 TCP I/O、
+客户端提交映射的完整链路（真实后端 + 真实服务端 + 真客户端，提交后新端口真的能被 `curl` 到、
+删掉后真的不再监听），以及管理台整条链路——管理台**自己拥有服务端**（服务端跑在后台线程），
+客户端跑在测试主循环里，验证启动后端口真的在监听、在线表真的出现带身份的客户端、
+管理台改映射后新端口可用**且广播真的到了客户端**、非法映射被拒且现状不变、
+停止真的关端口且能重启、没有 tkinter 时给出可读错误。
+
+窗口本身（`app.py` / `server_app.py`）不做自动化测试——它们需要显示器，
+改版式也不该影响这些断言；两个窗口都用临时脚本做过版式冒烟（列数/表头对齐、三态下拉、
+脏行标记、按钮可用性、状态栏与日志面板），跑完即删。
 
 ## 已知限制与后续路线
 
 - 只代理 TCP，不支持 UDP
 - 不做 HTTP 解析与改写：转发是纯字节搬运，仅在自己无法转发时才手写最小 HTTP 错误响应
 - 映射表默认只存内存；`--mapping-store file` 已可落盘，但**只支持单进程**（多实例共享同一文件会互相覆盖）
-- **界面改的是服务端的映射表**；客户端"认领哪些本机端口"仍来自启动配置
+- **两个界面改的都是服务端的映射表**；客户端"认领哪些本机端口"仍来自启动配置
   （协议里没有运行期修改认领端口的指令，要支持得先扩展协议）
+- **任何在线客户端都能改服务端映射表**：`set_mapping` 从一期起就没有按身份限制，
+  管理台没有改变这一点，只是让服务端侧也能看见和修改。要收口得给映射表写操作加权限判定
 - 图形界面需要 tkinter（CPython 标准库，不算第三方依赖）；
   精简安装的 Linux 上可能需要 `apt install python3-tk`
+- **管理台是本机同进程的，不做远程管理**：它读的是 `TunnelServer` 对象、
+  调的是进程内方法，没有新增任何指令。也因此**关掉管理台窗口 = 服务端下线**
+  （访客端口全部关闭）；要长期托管请用 `server.py`
+- 管理台**看不到"哪次注册被拒、为什么"**：注册被拒只累加 `stats.registrations_rejected`，
+  没有对应事件（服务端 stderr 里有 WARNING 日志）。这是本轮刻意的最小改动，
+  真要补就得新增一个进程内事件——不涉及协议，属于后续候选
+- 管理台的在线客户端表**只读**，不做踢人：没有"谁能管理服务端"的权限模型之前，
+  一个误点的按钮就能掐断正在服务的隧道
+- 管理台**每 0.5 秒采样一次**状态，所以界面上的在线数与字节数最多滞后一个采样周期；
+  要更实时得加推送而非提高采样率（采样率越高，事件循环线程被占用的时间越多）
 - 限流是**按客户端聚合**的粗粒度：同一客户端的所有端口共享一份带宽额度，
   要做"按端口"或"按访客 IP"限速需换 `RateLimitHook` 实现
 - 限流与配额**只在服务端生效**：客户端侧不做自我限速（服务端是唯一的流量汇聚点，
@@ -784,4 +878,5 @@ GUI 相关的三项测试（`test_gui_model` / `test_gui_bridge` / `test_gui_con
 - 访客端口**不做运行时协议探测**：服务端在配对前不读访客一个字节（纯透传），
   所以"明文请求打到了 TLS 端口"这类错配只能靠启动日志的逐端口状态提示，不会自动纠正
 
-后续计划：服务端侧管理界面 → 按请求的带宽统计与限流粒度细化。
+后续计划：按请求的带宽统计与限流粒度细化（按端口 / 按访客 IP）→ 远程管理
+（需要协议扩展 + 管理权限模型）→ 给映射表写操作加权限判定。

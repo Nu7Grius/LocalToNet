@@ -65,6 +65,7 @@ class ClientSession:
         return {
             "client_id": self.client_id,
             "peer": self.peer,
+            "identity": self.identity,
             "local_ports": sorted(self.local_ports),
             "online_seconds": round(time.monotonic() - self.connected_at, 1),
             "idle_seconds": round(self.idle_for(), 1),
