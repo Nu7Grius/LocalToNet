@@ -37,6 +37,7 @@ __all__ = [
     "ListenerConfig",
     "AuthConfig",
     "LimitsConfig",
+    "AdminConfig",
     "MappingStoreConfig",
     "ServerTlsConfig",
     "ClientTlsConfig",
@@ -49,6 +50,13 @@ DEFAULT_SERVER_CONFIG = "config.json"
 DEFAULT_CLIENT_CONFIG = "client.json"
 
 _MAX_PORT = 65535
+
+DEFAULT_KICK_COOLDOWN = 30.0
+"""管理台踢人后的默认冷却秒数（``admin.kick_cooldown``）。
+
+默认**不是** 0：踢完立刻允许重连等于没踢——客户端自己的重连退避初始延迟是个位数秒级，
+被踢的那台机器下一轮就回来了。30 秒给运维留出一个"它确实离开了"的窗口，
+又不至于让误踢变成一次长时间故障。"""
 
 
 class ConfigError(TunnelError):
@@ -97,6 +105,18 @@ def _as_env_bool(value: str, where: str) -> bool:
     if text in _ENV_FALSE:
         return False
     raise ConfigError(f"{where} 只接受 {_ENV_TRUE + _ENV_FALSE} 之一，实际为 {value!r}")
+
+
+def _as_env_float(value: str, where: str) -> float:
+    """解析环境变量里的浮点数。
+
+    环境变量永远是字符串，**不能直接过** :func:`_as_float`——那是个 JSON 值的类型校验器，
+    拿到 ``"30"`` 会报"必须是数字，实际为 str"，于是这个环境变量等于永远不可用。
+    """
+    try:
+        return float(value.strip())
+    except ValueError as exc:
+        raise ConfigError(f"{where} 必须是数字，实际为 {value!r}") from exc
 
 
 def _check_unknown(data: Mapping[str, Any], allowed: Tuple[str, ...], where: str) -> None:
@@ -404,6 +424,61 @@ class LimitsConfig:
 
 
 @dataclass
+class AdminConfig:
+    """管理台这类**运维动作**的参数。
+
+    刻意与 ``limits`` 分开：``limits`` 里的数字全是"流量/容量的边界"，
+    而这里的数字描述的是"人对服务端做了一次干预之后，服务端要保持多久这个状态"。
+    两者的校验规则也不同（配额 0 表示不限、容量必须为正，而这里的 0 表示"不冷却"）。
+    """
+
+    kick_cooldown: float = DEFAULT_KICK_COOLDOWN
+    """被管理台**踢出**的 client_id，在这么多秒内拒绝重新注册。
+
+    ``0`` 表示不冷却——那等于"只是断一下"：客户端自己的重连退避初始延迟是个位数秒级，
+    被踢的机器下一轮就回来了，运维想要的"让它离开一会儿"根本没发生。
+
+    冷却期的拒绝走 ``403 + retryable=true``（与"端口未授权"同一类语义：**暂时**不行，
+    等会儿再来），客户端会按退避策略继续重试，冷却一过自动上车，不需要人工重启它。
+    刻意**不用** ``503``：那在本项目里是"服务端整体没位置"，
+    会把"这台机器被踢了"说成"服务器满了"，把排查引向错误方向。
+    """
+
+    _FIELDS = ("kick_cooldown",)
+
+    @classmethod
+    def from_dict(cls, data: Optional[Mapping[str, Any]]) -> "AdminConfig":
+        if data is None:
+            return cls()
+        _check_unknown(data, cls._FIELDS, "admin")
+        values: Dict[str, Any] = {
+            key: _as_float(raw, f"admin.{key}") for key, raw in data.items()
+        }
+        return cls(**values)
+
+    @classmethod
+    def from_env(cls, base: Optional["AdminConfig"] = None) -> "AdminConfig":
+        """在已有配置上叠加环境变量覆盖（只有 ``kick_cooldown`` 一项）。"""
+        cfg = base or cls()
+        env = _env_map()
+        if "admin_kick_cooldown" in env:
+            cfg.kick_cooldown = _as_env_float(
+                env["admin_kick_cooldown"], "LOCALTONET_ADMIN_KICK_COOLDOWN"
+            )
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        value = self.kick_cooldown
+        # nan 会让每一次比较都为假 → "冷却中"与"已过期"同时不成立，
+        # 判定分支会静默走成"不在冷却期"。这种值必须在这里拦死。
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ConfigError(f"admin.kick_cooldown 必须是有限数字，实际为 {value!r}")
+        if value < 0:
+            raise ConfigError("admin.kick_cooldown 不能为负数（0 表示不冷却）")
+
+
+@dataclass
 class MappingStoreConfig:
     """映射表存储后端。
 
@@ -637,6 +712,9 @@ class ServerConfig:
     reconnect: ReconnectPolicy = field(default_factory=ReconnectPolicy)
     auth: AuthConfig = field(default_factory=AuthConfig)
     limits: LimitsConfig = field(default_factory=LimitsConfig)
+    admin: AdminConfig = field(default_factory=AdminConfig)
+    """管理台这类运维动作的参数（踢人冷却期）。**只在服务端配置里**：
+    管理台是服务端进程里的窗口，客户端配置写 ``admin`` 会被 ``_check_unknown`` 拒掉。"""
     tls: ServerTlsConfig = field(default_factory=ServerTlsConfig)
     """控制通道与数据通道的传输加密。默认关闭＝明文，与 TLS 落地前完全一致。"""
     log: LogConfig = field(default_factory=LogConfig)
@@ -652,6 +730,7 @@ class ServerConfig:
         "reconnect",
         "auth",
         "limits",
+        "admin",
         "tls",
         "log",
     )
@@ -679,6 +758,7 @@ class ServerConfig:
             reconnect=ReconnectPolicy.from_dict(data.get("reconnect")),
             auth=AuthConfig.from_dict(data.get("auth")),
             limits=LimitsConfig.from_dict(data.get("limits")),
+            admin=AdminConfig.from_dict(data.get("admin")),
             tls=ServerTlsConfig.from_dict(data.get("tls")),
             log=LogConfig.from_dict(data.get("log")),
         )
@@ -740,7 +820,9 @@ class ServerConfig:
         if "tls_enabled" in env:
             cfg.tls.enabled = _as_env_bool(env["tls_enabled"], "LOCALTONET_TLS_ENABLED")
         if "tls_handshake_timeout" in env:
-            cfg.tls.handshake_timeout = _as_float(
+            # 环境变量是字符串，必须走 _as_env_float；直接过 _as_float（JSON 类型校验器）
+            # 会让这个环境变量**永远**报"必须是数字，实际为 str"——等于它从来没生效过
+            cfg.tls.handshake_timeout = _as_env_float(
                 env["tls_handshake_timeout"], "LOCALTONET_TLS_HANDSHAKE_TIMEOUT"
             )
         # 访客端口 TLS：同样"给出证书路径即隐式开启"，但它们只影响全局默认
@@ -757,6 +839,9 @@ class ServerConfig:
             )
         if "log_level" in env:
             cfg.log.level = env["log_level"].upper()
+        # 管理台侧的运维开关：与 limits / mapping[].tls 同一先例，只有 JSON 与环境变量两条路，
+        # **不做 CLI**（它描述的是"管理台点了踢人之后服务端怎么反应"，不是启动参数）
+        cfg.admin = AdminConfig.from_env(cfg.admin)
         cfg.validate()
         return cfg
 
@@ -786,6 +871,7 @@ class ServerConfig:
         self.auth.validate()
         self.mapping_store.validate()
         self.limits.validate()
+        self.admin.validate()
         self.tls.validate()
         self.log.validate()
 

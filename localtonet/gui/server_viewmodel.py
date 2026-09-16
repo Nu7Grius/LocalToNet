@@ -10,6 +10,7 @@ localtonet.gui.server_viewmodel —— 管理台侧的唯一状态所有者
 ``event``           服务端事件总线里的一个事件（上线 / 下线 / 转发失败……），只用来写日志
 ``snapshot``        :meth:`TunnelServer.snapshot` 的定时快照，负责表格与所有计数器
 ``mapping_result``  管理台提交映射的本地结果（**不是** socket 回执，见 server_controller）
+``kick_result``     管理台踢人的本地结果（同上，也没有回执报文）
 ``local``           界面自己产生的提示（比如"服务端启动失败"）
 
 这里有一处与客户端侧**必须不同**的地方，值得单独说：
@@ -35,6 +36,7 @@ from localtonet.gui.server_model import (
     append_server_log,
     apply_server_event,
     mapping_signature,
+    note_kick_result,
     note_server_mapping_result,
 )
 from logging_setup import get_logger
@@ -115,6 +117,12 @@ class ServerViewModel:
                 self._apply_mapping_result(dict(result))
                 return True
             return False
+        if kind == "kick_result":
+            result = payload.get("result")
+            if isinstance(result, Mapping):
+                self._apply_kick_result(dict(result))
+                return True
+            return False
         if kind == "local":
             level = str(payload.get("level") or "info")
             text = str(payload.get("text") or "")
@@ -170,6 +178,18 @@ class ServerViewModel:
             self._remote_signature = mapping_signature(
                 [row.to_dict() for row in self._table.snapshot]
             )
+
+    def _apply_kick_result(self, result: Dict[str, Any]) -> None:
+        """踢人的结果只写日志与提示。
+
+        刻意**不碰映射表工作副本**——踢人与映射表无关。（对照
+        :meth:`_apply_mapping_result`：那个必须 ``mark_submitted`` + 刷指纹，
+        因为提交成功后界面上那份工作副本就是服务端认下的版本；踢人不改变任何映射，
+        去刷指纹只会把用户正在编辑的内容误判成"已同步"。）
+        """
+        self._state = note_kick_result(
+            self._state, bool(result.get("ok")), str(result.get("msg") or "")
+        )
 
     def __repr__(self) -> str:
         return f"ServerViewModel(clients={self._state.client_count}, dirty={self._table.is_dirty})"

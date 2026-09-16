@@ -12,6 +12,8 @@ from pathlib import Path
 import pytest
 
 from config import (
+    DEFAULT_KICK_COOLDOWN,
+    AdminConfig,
     AuthConfig,
     ClientConfig,
     ClientTlsConfig,
@@ -290,6 +292,104 @@ def test_bad_env_shared_mapping_write_is_rejected(monkeypatch: pytest.MonkeyPatc
 
     with pytest.raises(ConfigError, match="LOCALTONET_AUTH_SHARED_CAN_MANAGE_MAPPING"):
         ServerConfig.from_env(ServerConfig(mapping=[MappingRule(9028, 8000)]))
+
+
+# --------------------------------------------------------------------------- #
+# 管理台踢人冷却（admin，七期）
+# --------------------------------------------------------------------------- #
+
+
+def test_kick_cooldown_defaults_to_thirty_seconds() -> None:
+    """默认**不是** 0：踢完立刻允许重连等于没踢（客户端退避初始延迟是个位数秒级）。
+
+    这是个"默认值本身就有语义"的开关，所以单独立一条用例钉住它——
+    与 ``limits.rate_limit_scope`` 的默认值同一类：翻过去就是一次行为事故。
+    """
+    assert AdminConfig().kick_cooldown == DEFAULT_KICK_COOLDOWN == 30.0
+    assert ServerConfig(mapping=[MappingRule(9028, 8000)]).admin.kick_cooldown == 30.0
+
+
+def test_kick_cooldown_reads_from_json_and_survives_round_trip() -> None:
+    cfg = ServerConfig.from_dict(
+        {
+            "mapping": [{"public_port": 9028, "local_port": 8000}],
+            "admin": {"kick_cooldown": 2.5},
+        }
+    )
+
+    assert cfg.admin.kick_cooldown == 2.5
+    # 必须能活着穿过序列化，否则"存一次盘就悄悄变回 30 秒"
+    assert ServerConfig.from_dict(cfg.to_dict()).admin.kick_cooldown == 2.5
+    # 0 是合法取值："只断一下"
+    assert AdminConfig.from_dict({"kick_cooldown": 0}).kick_cooldown == 0
+
+
+def test_kick_cooldown_reads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """环境变量是字符串，``"0"`` 必须真能把冷却关掉。
+
+    这条盯的是"数值环境变量不能直接过 ``_as_float``"（那个 helper 只认数字类型，
+    拿到字符串一律报错，于是环境变量等于永远不可用）。
+    """
+    monkeypatch.setenv("LOCALTONET_ADMIN_KICK_COOLDOWN", "0")
+    assert (
+        ServerConfig.from_env(ServerConfig(mapping=[MappingRule(9028, 8000)])).admin.kick_cooldown
+        == 0.0
+    )
+
+    monkeypatch.setenv("LOCALTONET_ADMIN_KICK_COOLDOWN", "1.5")
+    assert (
+        ServerConfig.from_env(ServerConfig(mapping=[MappingRule(9028, 8000)])).admin.kick_cooldown
+        == 1.5
+    )
+
+
+def test_bad_kick_cooldown_is_rejected() -> None:
+    """负数、字符串、nan 都要在启动时炸掉，别让它们在运行期变成"冷却期判定静默失效"。"""
+    for value in (-1, -0.5):
+        with pytest.raises(ConfigError, match="不能为负数"):
+            AdminConfig.from_dict({"kick_cooldown": value}).validate()
+    for value in ("30", None, []):
+        with pytest.raises(ConfigError, match="必须.*数字"):
+            AdminConfig.from_dict({"kick_cooldown": value})
+    # nan 会让每一次比较都为假 → "冷却中"与"已过期"同时不成立，判定分支会静默走成"不在冷却期"
+    with pytest.raises(ConfigError, match="有限数字"):
+        AdminConfig.from_dict({"kick_cooldown": float("nan")}).validate()
+
+
+def test_kick_cooldown_typo_is_rejected() -> None:
+    """写错一个词也要 fail fast，不能悄悄退回 30 秒。"""
+    with pytest.raises(ConfigError, match="未知字段"):
+        ServerConfig.from_dict(
+            {
+                "mapping": [{"public_port": 9028, "local_port": 8000}],
+                "admin": {"kick_cooldown_sec": 5},
+            }
+        )
+
+
+def test_bad_env_kick_cooldown_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LOCALTONET_ADMIN_KICK_COOLDOWN", "soon")
+    with pytest.raises(ConfigError, match="LOCALTONET_ADMIN_KICK_COOLDOWN"):
+        ServerConfig.from_env(ServerConfig(mapping=[MappingRule(9028, 8000)]))
+
+
+def test_client_config_rejects_the_admin_block() -> None:
+    """``admin`` 是服务端的运维开关（管理台在服务端进程里），客户端配置写它要被拒。"""
+    with pytest.raises(ConfigError, match="未知字段"):
+        ClientConfig.from_dict({"local_ports": [8000], "admin": {"kick_cooldown": 5}})
+
+
+def test_tls_handshake_timeout_env_actually_applies(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``LOCALTONET_TLS_HANDSHAKE_TIMEOUT`` 以前**必然**报"必须是数字，实际为 str"。
+
+    这是本轮新增 ``_as_env_float`` 时顺手发现的既有缺陷（数值环境变量不能走
+    ``_as_float``）。钉住它，免得下次有人又把环境变量直接喂给那个 JSON 类型校验器。
+    """
+    monkeypatch.setenv("LOCALTONET_TLS_HANDSHAKE_TIMEOUT", "30")
+
+    cfg = ServerConfig.from_env(ServerConfig(mapping=[MappingRule(9028, 8000)]))
+
+    assert cfg.tls.handshake_timeout == 30.0
 
 
 def test_client_rejects_empty_local_ports() -> None:

@@ -33,6 +33,7 @@ import contextlib
 import logging
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -75,6 +76,23 @@ _HTTP_PHRASES = {
     502: "Bad Gateway",
     503: "Service Unavailable",
 }
+
+_KICK_COOLDOWN_MAX_ENTRIES = 1024
+"""冷却期表的条目上限。刻意不是"每客户端"而是**全局**，理由同 ``rate_limit_max_keys``：
+它是一条长期驻留的表（条目只在冷却期满后遇到同一个 client_id 再注册时才清掉，
+被踢过就再没回来的机器会一直占着一行），不设上限就是一条缓慢的内存增长路径。
+正常部署里管理台踢过的不同 client_id 是个位数量级，撞到上限说明有人在反复踢不同的机器。"""
+
+
+def _kick_reason(cooldown: float) -> str:
+    """踢人这条下线原因的文案。
+
+    它会被写进 INFO 日志、塞进 ``CLIENT_DISCONNECTED`` 事件、再显示到管理台日志面板，
+    所以必须自解释：运维看到"被管理台踢出"时，下一个问题必然是"它多久能回来"。
+    """
+    if cooldown <= 0:
+        return "被管理台踢出（未设冷却期，它可以立刻重连）"
+    return f"被管理台踢出（{cooldown:g}s 内拒绝该 client_id 重连）"
 
 
 @dataclass
@@ -220,6 +238,13 @@ class TunnelServer:
         )
         self._dispatcher = MessageDispatcher.from_object(self, logger=self._log)
         self._stats = ServerStats()
+
+        # 管理台踢人后的冷却期：``client_id -> 冷却截止时间（monotonic）``。
+        # **只有管理台主动踢人才登记**——被顶号、心跳超时、控制连接断开都不登记：
+        # 那些是"这条连接没了"，不是"这台机器被要求离开一会儿"，给它们加冷却会变成
+        # "客户端网络抖一下就再也上不来"，与看门狗的意图正好相反。
+        # 用 OrderedDict 而不是普通 dict：满了要淘汰**最早**登记的那条（见 _remember_kick）。
+        self._kick_cooldowns: "OrderedDict[str, float]" = OrderedDict()
 
         self._control_server: Optional[asyncio.AbstractServer] = None
         self._data_server: Optional[asyncio.AbstractServer] = None
@@ -368,6 +393,7 @@ class TunnelServer:
             "stats": self._stats.to_dict(),
             "bandwidth": self._bandwidth_snapshot(),
             "rate_limit": self._rate_limit_snapshot(),
+            "kick_cooldowns": self._kick_cooldown_snapshot(),
         }
 
     def _bandwidth_snapshot(self) -> Dict[int, Dict[str, Any]]:
@@ -407,6 +433,79 @@ class TunnelServer:
         diff = await self._mapping.apply(rules)
         await self._broadcast_mapping_list()
         return diff
+
+    async def kick_client(self, client_id: str) -> bool:
+        """把一个**在线**客户端踢下线（管理台的动作），返回是否真的踢掉了。
+
+        与 :meth:`submit_mapping` 不同，这不是"改状态"而是"断人"：调用之后该客户端的
+        控制连接立刻断开、它认领的端口归属立即释放、排队中的访客收到失败，
+        并且 ``admin.kick_cooldown`` 秒内拒绝它重新注册（否则等于没踢，
+        客户端自己的重连退避初始延迟本来就是个位数秒级）。
+
+        复用 :meth:`_disconnect_session`：顶号、心跳超时、管理台踢出三条路要做的清理
+        完全一样（摘注册表、放端口、回收限速桶、唤醒挂起项、关连接、发事件、广播映射），
+        各写一遍迟早出现"这条路径忘了回收限速桶"这类只在一种入口复现的泄漏。
+
+        ``client_id`` 不在线时返回 ``False`` 且**不登记冷却期**：管理台每 0.5 秒采样一次，
+        用户点下去时目标可能刚掉线，这是正常竞态而非错误——更不该顺手给它安一个冷却期，
+        那会把"它自己掉了"变成"它被禁止重连"。
+        """
+        session = self._registry.get(client_id)
+        if session is None:
+            return False
+
+        # 冷却期必须在 await **之前**登记：_disconnect_session 里有 await（关连接、广播映射），
+        # 先断连接再登记的话，客户端抢在登记完成前重连就能从这个窗口里钻进来。
+        # 窗口只有毫秒级，但"踢完立刻又在线"正是这个功能要消灭的现象。
+        cooldown = self._config.admin.kick_cooldown
+        self._remember_kick(client_id, cooldown)
+        await self._disconnect_session(client_id, reason=_kick_reason(cooldown), session=session)
+        return True
+
+    def _remember_kick(self, client_id: str, cooldown: float) -> None:
+        """登记一段冷却期。临界区内不含 await。"""
+        # 先 pop 再插：同一个 client_id 再次被踢时位置要挪到队尾
+        # （淘汰按"最早登记的先走"，别让一条老记录挡住新记录）
+        self._kick_cooldowns.pop(client_id, None)
+        if cooldown <= 0:
+            # 0 秒＝不冷却。语义是"只断一下"，那就不要留下任何状态，
+            # 免得表里堆一批立刻过期的条目
+            return
+        self._kick_cooldowns[client_id] = time.monotonic() + cooldown
+        self._evict_kick_cooldowns()
+
+    def _evict_kick_cooldowns(self) -> None:
+        """把冷却期表压回上限以内：先清过期的，再淘汰最早登记的。临界区内不含 await。"""
+        now = time.monotonic()
+        for key in [key for key, deadline in self._kick_cooldowns.items() if deadline <= now]:
+            self._kick_cooldowns.pop(key, None)
+        while len(self._kick_cooldowns) > _KICK_COOLDOWN_MAX_ENTRIES:
+            self._kick_cooldowns.popitem(last=False)
+
+    def _cooldown_remaining(self, client_id: str) -> float:
+        """还剩多少秒冷却；``<= 0`` 表示不在冷却期（顺手清掉过期条目）。临界区内不含 await。"""
+        deadline = self._kick_cooldowns.get(client_id)
+        if deadline is None:
+            return 0.0
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            self._kick_cooldowns.pop(client_id, None)
+            return 0.0
+        return remaining
+
+    def _kick_cooldown_snapshot(self) -> Dict[str, float]:
+        """还在冷却期里的 ``client_id -> 剩余秒数``。
+
+        与 ``bandwidth`` 同理单独暴露、**不进** ``stats.to_dict()``（``stats`` 是给状态栏
+        按名字取值的扁平标量表）。冷却期属于"看不见就会误判"的状态：没有它，
+        界面只能显示"那台机器一直没上来"，看起来像配置坏了。
+        """
+        result: Dict[str, float] = {}
+        for key in list(self._kick_cooldowns):
+            remaining = self._cooldown_remaining(key)
+            if remaining > 0:
+                result[key] = round(remaining, 1)
+        return result
 
     # ------------------------------------------------------------------ #
     # 控制通道
@@ -525,6 +624,32 @@ class TunnelServer:
                 retryable=exc.retryable,
                 client_id=client_id,
                 peer=peer,
+            )
+            return None
+
+        # 冷却期：管理台刚把这台机器踢掉，短时间内不许它重新上车。
+        # 判定刻意排在**鉴权之后**：这条拒绝也走 REGISTRATION_REJECTED，
+        # 若排在鉴权之前，"令牌已失效"会被渲染成"你在冷却期"，排查方向直接被指错。
+        # 又排在**容量之前**：整机满了是所有人的问题，而"你被踢了"是针对这一台的，
+        # 更具体的那个原因先报（同"端口未授权排在容量之后"的取舍，方向相反而已）。
+        remaining = self._cooldown_remaining(client_id)
+        if remaining > 0:
+            await self._reject_register(
+                writer,
+                code=403,
+                msg=(
+                    f"该客户端刚被管理台踢出，冷却期还剩 {remaining:.0f}s"
+                    f"（admin.kick_cooldown={self._config.admin.kick_cooldown:g}，"
+                    "冷却结束前无法重新注册）"
+                ),
+                # retryable=True：这是"暂时不行，等会儿再来"，与"端口未授权"同一类。
+                # 客户端会按退避策略继续重试，冷却一过自动上车。
+                # 刻意不用 503（那在本项目里是"服务端整体没位置"，
+                # 会把"这台机器被踢了"说成"服务器满了"）也不用 429（那是单客户端配额）。
+                retryable=True,
+                client_id=client_id,
+                peer=peer,
+                identity=identity.name,
             )
             return None
 

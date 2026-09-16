@@ -210,6 +210,41 @@ class ServerController:
         self._bridge.post("mapping_result", result=result)
         return result
 
+    async def kick_client(self, client_id: str) -> Dict[str, Any]:
+        """踢出一个在线客户端并把结果投给界面。
+
+        与 :meth:`submit_mapping` 同一套结果形状（``{"ok": bool, "msg": str}``），
+        界面因此只需要处理一种形状。``ok=False`` 有两种来由，界面上都表现为一句可读的话：
+
+        * **目标已经不在线**（界面每 0.5 秒采样一次，用户点下去时它可能刚自己掉线）——
+          这是正常竞态，不是错误，所以不抛异常、不弹错误框；
+        * 服务端拒绝（如 ``kick_cooldown`` 配上非法值导致配置错误），转成日志。
+
+        踢掉之后**不需要**在这里手工发事件或刷新表格：断开走 ``TunnelServer`` 的下线内核，
+        它会发 ``CLIENT_DISCONNECTED``（已在转发白名单里）并广播映射表，
+        界面下一次采样就看不到这台机器了。
+        """
+        try:
+            kicked = await self._server.kick_client(client_id)
+        except (ConfigError, TunnelError) as exc:
+            self._log.warning("管理台踢出客户端 %s 被拒绝：%s", client_id, exc)
+            result: Dict[str, Any] = {
+                "ok": False,
+                "msg": getattr(exc, "message", None) or str(exc),
+            }
+        else:
+            result = {
+                "ok": kicked,
+                "msg": (
+                    f"已踢出 {client_id}"
+                    if kicked
+                    else f"客户端 {client_id} 已经不在线，无需踢出"
+                ),
+            }
+
+        self._bridge.post("kick_result", result=result)
+        return result
+
     # ------------------------------------------------------------------ #
     # 内部
     # ------------------------------------------------------------------ #

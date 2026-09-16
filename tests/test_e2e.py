@@ -31,6 +31,9 @@ tests/test_e2e.py —— 端到端链路验证
 24. 限速口径=按访客 IP       key 里只有 IP 不含临时端口；同一个 IP 的两次请求同一个桶
 25. 按端口带宽统计           snapshot()["bandwidth"] 的请求数/字节/限速等待与全局合计一致
 26. 限速口径可观测           snapshot()["rate_limit"] 报出口径与桶表水位，不限速时也报
+27. 管理台踢人               端口归属立即释放 + 冷却期内 403/retryable 拒绝重连 + 冷却后自动上车
+28. 踢不存在的客户端         空操作，且不留下冷却期（竞态不该变成"禁止它重连"）
+29. 冷却期为 0               "只断一下"：不留状态，客户端立刻能回来
 """
 
 from __future__ import annotations
@@ -851,5 +854,142 @@ def test_mapping_survives_server_restart(tmp_path: Path) -> None:
             assert server.mapping.listen_ports() == [persisted_port]
         finally:
             await server.stop()
+
+    asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------- #
+# 27 ~ 29：管理台踢人（七期）
+# --------------------------------------------------------------------------- #
+
+
+def _kick_cooldown(seconds: float) -> Callable[[ServerConfig], None]:
+    """配置夹具：把踢人冷却期压到测试等得起的尺度。"""
+
+    def configure(config: ServerConfig) -> None:
+        config.admin.kick_cooldown = seconds
+
+    return configure
+
+
+def test_kick_disconnects_client_releases_ports_and_enforces_cooldown() -> None:
+    """踢出＝断开 + 释放端口 + **暂时**拒绝重连，冷却结束后它自己回来。
+
+    四件事必须一起验，少一件都会漏掉一类真实缺陷：
+
+    * "端口真的释放"证明走的是下线内核（而不是只关了那条 socket）；
+    * "冷却期内被拒"证明踢完之后它不会立刻回来——客户端自己的重连退避初始延迟
+      是个位数秒级，不做冷却等于没踢；
+    * "冷却结束后自动上车"证明这是 ``403 + retryable=true``（暂时失败）而不是永久黑名单，
+      否则一次误踢就变成必须人工介入的故障；
+    * 冷却期的拒绝**带身份**，证明这条判定排在鉴权之后（排在之前它会是空串，
+      而且会把"令牌失效"渲染成"你在冷却期"，把排查方向指错）。
+    """
+    disconnected: List[Dict[str, Any]] = []
+    rejected: List[Dict[str, Any]] = []
+    cooldown = 1.0
+
+    async def scenario() -> None:
+        async with TunnelHarness(configure_server=_kick_cooldown(cooldown)) as harness:
+            assert harness.server is not None and harness.client is not None
+            server = harness.server
+            client_id = harness.client.client_id
+            backend_port = harness.backend.port
+
+            server.events.on(EventType.CLIENT_DISCONNECTED, lambda **payload: disconnected.append(payload))
+            server.events.on(EventType.REGISTRATION_REJECTED, lambda **payload: rejected.append(payload))
+
+            # 踢之前：在线、端口归它、能转发
+            assert server.registry.owner_of(backend_port) == client_id
+            assert (await http_request(harness.public_port, "/echo?msg=before")).status == 200
+
+            assert await server.kick_client(client_id) is True
+
+            # ① 端口归属立即释放（下线内核负责的事，不是只关连接）
+            await harness.wait_until(
+                lambda: server.registry.owner_of(backend_port) is None,
+                what="踢出后端口归属释放",
+            )
+            # ② 冷却期登记了，而且在快照里读得出来（看不见就会误判成"配置坏了"）
+            assert server.snapshot()["kick_cooldowns"].get(client_id, 0) > 0
+
+            # ③ 冷却期内重连被拒：403 + retryable=true
+            await harness.wait_until(lambda: bool(rejected), timeout=10.0, what="冷却期拒绝重连")
+            first = rejected[0]
+            assert first["code"] == 403
+            assert first["retryable"] is True
+            assert "冷却" in first["msg"]
+            assert first["client_id"] == client_id
+            assert first["identity"] == "anonymous", "冷却期判定必须排在鉴权之后，身份该已确立"
+
+            # ④ 冷却结束之后它自己回来，不需要人工重启那个客户端
+            await harness.wait_until(
+                lambda: server.registry.get(client_id) is not None,
+                timeout=15.0,
+                what="冷却结束后客户端自动重新上线",
+            )
+            assert server.snapshot()["kick_cooldowns"] == {}
+
+            # ⑤ 断开事件说的是"管理台踢出"（管理台日志面板靠 reason 显示这条）
+            assert disconnected, "踢出必须发 CLIENT_DISCONNECTED"
+            assert "管理台" in disconnected[0]["reason"]
+            assert disconnected[0]["client_id"] == client_id
+            assert disconnected[0]["ports"] == [backend_port]
+
+            # ⑥ 上来之后照常服务
+            assert (await http_request(harness.public_port, "/echo?msg=after")).status == 200
+
+    asyncio.run(scenario())
+
+
+def test_kick_unknown_client_is_a_noop_and_starts_no_cooldown() -> None:
+    """踢一个不在线的 client_id：什么都不做，**也不登记冷却期**。
+
+    管理台每 0.5 秒采样一次，用户点下去时目标可能刚好自己掉线——那是正常竞态，
+    返回 ``False`` 让界面如实说"它已经不在线了"即可。
+    若顺手给它登记冷却期，就会把"它自己掉了"变成"它被禁止重连"，
+    在界面上表现为"我什么也没做，这台机器就再也上不来了"。
+    """
+
+    async def scenario() -> None:
+        async with TunnelHarness(configure_server=_kick_cooldown(30.0)) as harness:
+            assert harness.server is not None and harness.client is not None
+            server = harness.server
+
+            assert await server.kick_client("nobody-here") is False
+            assert server.snapshot()["kick_cooldowns"] == {}
+            # 在场的客户端不受任何影响
+            assert server.registry.get(harness.client.client_id) is not None
+            assert (await http_request(harness.public_port, "/echo?msg=ok")).status == 200
+
+    asyncio.run(scenario())
+
+
+def test_kick_without_cooldown_lets_the_client_return_at_once() -> None:
+    """``admin.kick_cooldown=0`` 的语义是"只断一下"：不留任何冷却状态，客户端立刻可回。
+
+    这条把 0 钉死，顺便证明两种取值走的是**同一段**下线内核，
+    差别只在"要不要登记一段禁止重连的时间"。
+    """
+
+    async def scenario() -> None:
+        async with TunnelHarness(configure_server=_kick_cooldown(0.0)) as harness:
+            assert harness.server is not None and harness.client is not None
+            server = harness.server
+            client_id = harness.client.client_id
+            backend_port = harness.backend.port
+
+            assert await server.kick_client(client_id) is True
+            assert server.snapshot()["kick_cooldowns"] == {}
+            await harness.wait_until(
+                lambda: server.registry.owner_of(backend_port) is None,
+                what="踢出后端口归属释放",
+            )
+            await harness.wait_until(
+                lambda: server.registry.get(client_id) is not None,
+                timeout=10.0,
+                what="不设冷却期时客户端立刻重新上线",
+            )
+            assert (await http_request(harness.public_port, "/echo?msg=back")).status == 200
 
     asyncio.run(scenario())

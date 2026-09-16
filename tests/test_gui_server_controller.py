@@ -21,6 +21,8 @@ tests/test_gui_server_controller.py —— 服务端管理台的端到端测试
 守六条线：启动后**端口真的在监听**；客户端上线后**在线表真的出现它**；
 管理台改映射**真的对所有客户端生效**（新端口可访问 + 客户端收到广播）；
 非法映射**被拒且不影响现状**；停止**真的关端口**且能重启；没有 tkinter 时给出可读错误。
+另外守住唯一的破坏性动作——**踢人**：服务端真的断开它、端口真的释放，
+而界面真的知道发生了什么（结果消息 + 下线事件 + 状态栏里的冷却期）。
 """
 
 from __future__ import annotations
@@ -627,6 +629,121 @@ def test_server_side_mapping_table_keeps_user_edit_on_remote_change(run_async) -
             assert vm.table.remote_stale is True
             # 但"已保存"的参照物已经跟着远端更新了（否则用户放弃修改会回到更旧的版本）
             assert sorted(row.public_port for row in vm.table.snapshot) == sorted([ports[2], other])
+
+        await backend.stop()
+
+    run_async(scenario)
+
+
+# --------------------------------------------------------------------------- #
+# 踢人
+# --------------------------------------------------------------------------- #
+
+
+def test_kick_result_message_lands_in_the_admin_log() -> None:
+    """``kick_result`` 是**本地结果**（同 mapping_result，没有回执报文），界面照样只处理一种形状。
+
+    这条不起网络，只把管理台侧那条消息喂给 ViewModel。顺带钉住一条容易写错的边界：
+    踢人**不碰**映射表工作副本——如果照抄 ``_apply_mapping_result`` 去
+    ``mark_submitted``，用户正在编辑的映射会被误判成"已同步"。
+    """
+    vm = ServerViewModel()
+    vm.table.add_row(public_port=9028, local_port=8000)
+    assert vm.table.is_dirty
+
+    changed = vm.apply(("kick_result", {"result": {"ok": True, "msg": "已踢出 admin-c1"}}))
+
+    assert changed is True
+    assert any("管理台踢出：已踢出 admin-c1" in entry.text for entry in vm.state.log)
+    assert "管理台踢出" in vm.state.notice
+    assert vm.table.is_dirty, "踢人与映射表无关，不该动用户正在编辑的工作副本"
+
+
+def test_admin_kicks_a_client_and_sees_the_whole_story(run_async) -> None:
+    """管理台踢人整条链路：服务端真断了它、端口真释放，界面收到结果与下线事件。
+
+    与服务端侧那条 e2e 用例（``test_e2e.py::test_kick_disconnects_...``）验的是**不同接缝**：
+    那边验判定逻辑（端口释放 / 冷却期 / 自动上车），这边验
+    "按钮点下去之后，界面知道发生了什么"——``kick_result`` 消息、
+    ``CLIENT_DISCONNECTED`` 穿过转发白名单到达日志面板、状态栏看得见冷却期。
+    """
+
+    async def scenario() -> None:
+        backend = DemoBackend("127.0.0.1", 0)
+        backend_port = await backend.start()
+        ports = free_ports(3)
+        config = build_server_config(backend_port=backend_port, ports=tuple(ports))
+        # 冷却期放到 30 秒：这条用例只关心"踢掉了、界面看得见"，不需要等它自己回来
+        config.admin.kick_cooldown = 30.0
+        config.validate()
+
+        with admin_runtime(config) as (loop_thread, bridge, controller):
+            vm = ServerViewModel(idle_timeout=config.timeouts.client_idle_timeout)
+            await await_thread(loop_thread.submit(controller.start()))
+            await pump_until(vm, bridge, lambda: vm.state.listening, what="管理台收到启动快照")
+
+            client = TunnelClient(
+                build_client_config(
+                    ports=(ports[0], ports[1]), backend_port=backend_port, client_id="admin-kick"
+                )
+            )
+            client_task = asyncio.create_task(client.run(), name="admin-test-client-kick")
+            try:
+                await wait_client_online(client, controller.snapshot)
+                await pump_until(vm, bridge, lambda: vm.state.client_count == 1, what="在线表出现客户端")
+
+                # ① 界面手上的那一行，正是确认框要显示的内容
+                row = vm.state.clients[0]
+                assert row.client_id == "admin-kick"
+                assert row.ports == (backend_port,)
+
+                # ② 踢出：结果经邮筒回到界面
+                result = await await_thread(loop_thread.submit(controller.kick_client(row.client_id)))
+                assert result["ok"] is True, result
+                assert "admin-kick" in result["msg"]
+
+                await pump_until(
+                    vm,
+                    bridge,
+                    lambda: any("管理台踢出" in entry.text for entry in vm.state.log),
+                    what="踢出结果到达界面",
+                )
+                assert "管理台踢出" in vm.state.notice
+
+                # ③ 服务端侧：真的下线了，且登记了冷却期
+                assert controller.snapshot()["clients"] == []
+                assert controller.snapshot()["kick_cooldowns"].get("admin-kick", 0) > 0
+
+                # ④ 界面侧：下线事件穿过转发白名单到达日志面板，原因写明是"管理台"
+                await pump_until(
+                    vm,
+                    bridge,
+                    lambda: any("客户端下线" in entry.text for entry in vm.state.log),
+                    what="下线事件到达管理台",
+                )
+                assert any(
+                    "管理台" in entry.text for entry in vm.state.log if "客户端下线" in entry.text
+                )
+                # ⑤ 冷却期状态栏可见：冷却中的机器**不在**在线表里，只剩这一处能看见它。
+                #    等待条件是"界面手上的快照里出现冷却期"——事件（上面那条日志）比
+                #    周期快照先到，直接断言状态栏会读到**踢出之前**那一份快照（在线 1）
+                await pump_until(
+                    vm,
+                    bridge,
+                    lambda: vm.state.kick_cooldowns.get("admin-kick", 0) > 0,
+                    what="冷却期到达界面快照",
+                )
+                assert vm.state.client_count == 0
+                assert "踢出冷却中" in vm.state.status_line()
+
+                # ⑥ 再踢一次同一个 id：不报错，界面如实说"已经不在线"
+                again = await await_thread(loop_thread.submit(controller.kick_client("admin-kick")))
+                assert again["ok"] is False
+                assert "不在线" in again["msg"]
+            finally:
+                await client.stop()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(client_task, timeout=5)
 
         await backend.stop()
 

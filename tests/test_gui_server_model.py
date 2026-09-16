@@ -29,6 +29,7 @@ from localtonet.gui.server_model import (
     append_server_log,
     apply_server_event,
     mapping_signature,
+    note_kick_result,
     note_server_mapping_result,
 )
 
@@ -221,6 +222,35 @@ def test_rate_limit_block_tolerates_missing_and_malformed_snapshot() -> None:
         assert state.rate_limit_scope == "client"
         assert state.rate_limit_evicted == 0
         assert "限速口径" not in state.status_line()
+
+
+# --------------------------------------------------------------------------- #
+# 踢人冷却（快照里的 kick_cooldowns）
+# --------------------------------------------------------------------------- #
+
+
+def test_kick_cooldowns_tolerate_missing_and_malformed_snapshot() -> None:
+    """老服务端没有这一块时按"没人在冷却期"处理，不许抛异常。"""
+    for snapshot in (
+        _snapshot(),  # 压根没有 kick_cooldowns 键（老服务端）
+        _snapshot(kick_cooldowns="nonsense"),
+        _snapshot(kick_cooldowns={"c1": "soon", "c2": True}),
+    ):
+        state = adopt_server_snapshot(ServerState(), snapshot)
+        assert state.kick_cooldowns == {}
+        assert "踢出冷却中" not in state.status_line()
+
+
+def test_status_line_reports_who_is_cooling_down() -> None:
+    """冷却期里的机器**不在**在线表里，状态栏是界面上唯一能看见它的地方。
+
+    没有这一格，界面只能表现为"那台机器一直没上来"，看起来像配置坏了。
+    """
+    state = adopt_server_snapshot(
+        ServerState(), _snapshot(kick_cooldowns={"c1": 12.6, "c2": 3.0})
+    )
+    assert state.kick_cooldowns == {"c1": 12.6, "c2": 3.0}
+    assert "踢出冷却中 2 台（剩 13秒）" in state.status_line()
 
 
 # --------------------------------------------------------------------------- #
@@ -459,6 +489,29 @@ def test_mapping_result_success_and_failure() -> None:
 def test_mapping_result_falls_back_when_message_missing() -> None:
     assert "已提交" in note_server_mapping_result(ServerState(), True, "").notice
     assert "提交失败" in note_server_mapping_result(ServerState(), False, "").notice
+
+
+def test_kick_result_success_and_failure_both_leave_a_trace() -> None:
+    """踢人是这个窗口唯一的"直接断人"动作，成败都要留痕。
+
+    失败那一路（大多是采样窗口里的竞态：界面显示在线，点下去时它已经掉线）
+    必须是 **warn** 而不是 error——它不是错误，只是"什么也没发生"，
+    但"我点了按钮却毫无反应"必须能在面板上读到。
+    """
+    ok = note_kick_result(ServerState(), True, "已踢出 admin-c1")
+    assert ok.log[-1].level == "ok"
+    assert "管理台踢出" in ok.log[-1].text
+    assert "已踢出 admin-c1" in ok.notice
+
+    raced = note_kick_result(ServerState(), False, "客户端 admin-c1 已经不在线，无需踢出")
+    assert raced.log[-1].level == "warn"
+    assert "不在线" in raced.log[-1].text
+    assert "不在线" in raced.notice
+
+
+def test_kick_result_falls_back_when_message_missing() -> None:
+    assert "已踢出" in note_kick_result(ServerState(), True, "").notice
+    assert "踢出失败" in note_kick_result(ServerState(), False, "").notice
 
 
 # --------------------------------------------------------------------------- #

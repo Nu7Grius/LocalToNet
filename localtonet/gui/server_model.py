@@ -40,6 +40,7 @@ __all__ = [
     "apply_server_event",
     "mapping_signature",
     "note_server_mapping_result",
+    "note_kick_result",
 ]
 
 ANONYMOUS_IDENTITY = "anonymous"
@@ -211,6 +212,23 @@ class ServerState:
         value = block.get("evicted")
         return value if isinstance(value, int) else 0
 
+    @property
+    def kick_cooldowns(self) -> Dict[str, float]:
+        """``client_id -> 剩余冷却秒数``：被管理台踢出、还没到重连时间的机器。
+
+        老服务端 / 老快照没有 ``kick_cooldowns`` 这一块，按"没有人在冷却期"处理
+        （同 ``rate_limit`` 的缺省口径处理）。这一屏信息必须看得见：冷却期里的机器
+        **不在**在线表里，没有它，界面上只表现为"那台机器一直没上来"，看起来像配置坏了。
+        """
+        block = self.snapshot.get("kick_cooldowns")
+        if not isinstance(block, Mapping):
+            return {}
+        return {
+            str(key): value
+            for key, value in block.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+
     def status_line(self) -> str:
         """状态栏文本。按"运维先想知道什么"排序，计数放后面。"""
         parts = [
@@ -234,6 +252,11 @@ class ServerState:
         evicted = self.rate_limit_evicted
         if evicted:
             parts.append(f"限速桶表淘汰 {evicted}")
+        cooling = self.kick_cooldowns
+        if cooling:
+            # 桶里的机器不在在线表里，只在冷却期结束后自己回来。剩余时间给最长的那个：
+            # 运维要知道的是"还要多久这一切恢复正常"，而不是每一台的精确读数
+            parts.append(f"踢出冷却中 {len(cooling)} 台（剩 {max(cooling.values()):.0f}秒）")
         return " ｜ ".join(parts)
 
 
@@ -454,6 +477,22 @@ def note_server_mapping_result(state: ServerState, ok: bool, msg: str) -> Server
         notice=f"映射{'已生效' if ok else '提交失败'}：{text}",
         last_diff=text,
     )
+
+
+def note_kick_result(state: ServerState, ok: bool, msg: str) -> ServerState:
+    """把管理台"踢出客户端"的结果写进日志与提示。
+
+    踢人是本窗口唯一的**直接断人**动作（映射表改动只影响之后的新请求，不会掐断已有隧道），
+    所以无论成败都要留痕：成功＝一次干预的审计线索（并提示冷却期会让它等一会儿才能回来），
+    失败＝"我点了按钮却什么也没发生"的解释（多半是采样窗口里的竞态：界面显示在线，
+    点下去时那台机器已经自己掉线了）。
+    """
+    text = msg or ("已踢出" if ok else "踢出失败")
+    updated = _append(
+        state,
+        [LogEntry(ts=_now(), level="ok" if ok else "warn", text=f"管理台踢出：{text}")],
+    )
+    return replace(updated, notice=f"管理台踢出：{text}")
 
 
 def _now() -> str:

@@ -16,8 +16,11 @@ localtonet.gui.server_app —— 服务端管理台的 tkinter 窗口
 
 铁律照旧：**别在这里等异步结果**。按钮只投协程，结果由邮筒回传。
 
-在线客户端表**没有任何写操作**（不做"踢人"）：一个误点的踢人按钮会把正在
-服务的隧道掐断，而本轮没有做权限模型——远端管理不该只有"点一下"的门槛。
+在线客户端表有**唯一一个写操作**：踢出选中客户端。它的门槛不是"权限模型"——
+能打开这个窗口的人本来就能停服务端、改全局映射表，权限边界是"本机同进程"这件事本身
+（见 README 的"管理台是本机同进程的"）。它要防的是**误点**：
+确认框里把身份、对端、认领的端口列全，并说明端口归属会立刻释放、
+冷却期内该客户端无法重连；真正的判定与执行都在服务端（``TunnelServer.kick_client``）。
 """
 
 from __future__ import annotations
@@ -31,9 +34,9 @@ from typing import Any, Dict, Optional
 
 from config import ConfigError, ServerConfig
 from localtonet.gui.bridge import LoopThread, UiBridge
-from localtonet.gui.model import MappingRow, describe_tls
+from localtonet.gui.model import MappingRow, describe_tls, fmt_ports
 from localtonet.gui.server_controller import ServerController
-from localtonet.gui.server_model import ClientRow
+from localtonet.gui.server_model import ANONYMOUS_IDENTITY, ClientRow
 from localtonet.gui.server_viewmodel import ServerViewModel
 from localtonet.gui.widgets import (
     DIRTY_TAG_BG,
@@ -124,6 +127,21 @@ class ServerGuiApp:
         frame = ttk.LabelFrame(self._root, text="在线客户端", padding=8)
         frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
 
+        # 底部动作条必须**先** pack：tk 的 pack 是先到先得，先塞一个
+        # fill=BOTH / expand=True 的 Treeview 会把剩余空间吃光，
+        # 之后再 pack(side=BOTTOM) 的动作条只剩 0 高度（按钮在界面上"消失"）
+        actions = ttk.Frame(frame)
+        actions.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+        self._buttons["kick"] = ttk.Button(
+            actions, text="踢出选中客户端", command=self._on_kick, width=16
+        )
+        self._buttons["kick"].pack(side=tk.LEFT)
+        ttk.Label(
+            actions,
+            text="（踢出会释放它认领的端口，并在冷却期内拒绝该客户端重连）",
+            foreground="#666666",
+        ).pack(side=tk.LEFT, padx=8)
+
         # 列序与 ClientRow.as_cells() 一致
         columns = ("identity", "client_id", "peer", "ports", "online", "idle")
         widths = (140, 160, 180, 220, 100, 120)
@@ -137,6 +155,9 @@ class ServerGuiApp:
         self._clients.configure(yscrollcommand=scrollbar.set)
         self._clients.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        # 选中变化要**立刻**反映到按钮可用性：_render() 只在邮筒非空时跑，
+        # 单靠它会出现"选中了一行但按钮还是灰的"（要等下一次快照/事件到达才更新）
+        self._clients.bind("<<TreeviewSelect>>", lambda _event: self._render_buttons())
 
     def _build_table(self) -> None:
         frame = ttk.LabelFrame(self._root, text="映射表（公网端口 → 内网端口，提交后对所有客户端生效）", padding=8)
@@ -269,6 +290,11 @@ class ServerGuiApp:
         self._buttons["add"].configure(state=tk.NORMAL)
         for key in ("duplicate", "remove"):
             self._buttons[key].configure(state=tk.NORMAL if has_selection else tk.DISABLED)
+        # 踢人：必须选中一行 + 服务端真的在跑。不额外要求"有权限"——
+        # 能打开这个窗口的人本来就能停服务端、改全局映射表（见模块文档的边界说明）
+        self._buttons["kick"].configure(
+            state=tk.NORMAL if (running and self._selected_client() is not None) else tk.DISABLED
+        )
 
     # ------------------------------------------------------------------ #
     # 动作：生命周期
@@ -294,6 +320,51 @@ class ServerGuiApp:
         self._want_running = False
         self._notice("info", "正在停止服务端…")
         self._submit_coroutine(self._controller.stop(), "停止服务端")
+
+    # ------------------------------------------------------------------ #
+    # 动作：踢出客户端
+    # ------------------------------------------------------------------ #
+
+    def _on_kick(self) -> None:
+        """踢掉在线表里选中的那个客户端。
+
+        这是本窗口**唯一直接断人**的操作，所以门槛刻意比"删除映射"更高一档：
+        确认框里把它会掐断什么（身份、对端、认领的端口）完整列出来再问一次。
+        真正的判定与执行都在服务端（``TunnelServer.kick_client``），
+        界面只负责"确认 + 投协程"，不在这一侧做"它到底还该不该被踢"的判断——
+        采样每 0.5 秒一次，界面手上的名单天生是滞后的。
+        """
+        row = self._selected_client()
+        if row is None:
+            self._notice("warn", "请先选中一个在线客户端")
+            return
+        if not self._want_running:
+            self._notice("warn", "服务端未运行，无法踢出客户端")
+            return
+        if not messagebox.askyesno("确认踢出客户端", self._kick_confirm_text(row), default=messagebox.NO):
+            return
+        self._notice("info", f"正在踢出 {row.client_id}…")
+        self._submit_coroutine(self._controller.kick_client(row.client_id), "踢出客户端")
+
+    @staticmethod
+    def _kick_confirm_text(row: ClientRow) -> str:
+        """确认框文案：把"点下去会掐断什么"写在点之前。
+
+        这一段刻意照抄运维的排查顺序（是谁 → 从哪来 → 占了哪些端口 → 之后会怎样），
+        因为误点一个"踢出"按钮的代价是正在服务的隧道被掐断，
+        而且用户在表格里看到的名单可能已经滞后一个采样周期了。
+        """
+        return (
+            "确定要踢出这个客户端吗？\n\n"
+            f"身份：{row.identity or ANONYMOUS_IDENTITY}\n"
+            f"客户端：{row.client_id or '-'}\n"
+            f"对端：{row.peer or '-'}\n"
+            f"认领端口：{fmt_ports(row.ports)}\n\n"
+            "踢出后：\n"
+            "· 它的控制连接立刻断开，正在通过它转发的请求会失败；\n"
+            "· 上面这些端口的归属立即释放，别的客户端可以抢占；\n"
+            "· 冷却期内（admin.kick_cooldown）它无法重新注册，冷却结束后会自己回来。"
+        )
 
     # ------------------------------------------------------------------ #
     # 动作：映射表编辑
@@ -422,6 +493,20 @@ class ServerGuiApp:
         if not iid:
             return None
         return int(iid)
+
+    def _selected_client(self) -> Optional[ClientRow]:
+        """在线表里当前选中的那一行；没选中或已被刷新掉时返回 ``None``。
+
+        iid 就是行号（``_render_clients`` 如此插入），所以每份新快照重建表格后
+        iid 会变、选中态会丢——这是"选中态天生可能失效"的原因，
+        这里返回 ``None`` 让调用方走"请先选中一行"的提示，而不是抛索引错误。
+        """
+        selection = self._clients.selection()
+        if not selection:
+            return None
+        rows = self._vm.state.clients
+        index = int(selection[0])
+        return rows[index] if 0 <= index < len(rows) else None
 
     def _selected_index(self) -> Optional[int]:
         selection = self._tree.selection()
