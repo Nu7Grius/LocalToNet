@@ -26,6 +26,11 @@ tests/test_e2e.py —— 端到端链路验证
 19. 在线客户端数             ServerStats.clients_online 随上下线变化
 20. 运行期映射落盘           客户端 set_mapping 的变更**当场写进持久化文件**
 21. 重启后映射仍在           服务端重启（配置文件给的是另一个端口）→ 仍监听持久化文件里的端口
+22. 限速口径=按客户端        不写 rate_limit_scope 时两个公网端口仍共用一份额度（兼容红线）
+23. 限速口径=按端口          桶按端口分（不按连接分），客户端下线后分片桶全部回收
+24. 限速口径=按访客 IP       key 里只有 IP 不含临时端口；同一个 IP 的两次请求同一个桶
+25. 按端口带宽统计           snapshot()["bandwidth"] 的请求数/字节/限速等待与全局合计一致
+26. 限速口径可观测           snapshot()["rate_limit"] 报出口径与桶表水位，不限速时也报
 """
 
 from __future__ import annotations
@@ -34,13 +39,14 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 import pytest
 
 from config import MappingRule, ServerConfig
 from localtonet.client.core import TunnelClient
 from localtonet.core.events import EventType
+from localtonet.core.limiter import compose_limit_key
 from localtonet.server.core import TunnelServer
 from localtonet.server.mapping import FileMappingStore
 from tests.helpers import TunnelHarness, free_ports, http_request, http_stream_chunks
@@ -535,6 +541,202 @@ def test_download_bandwidth_limit_slows_transfer_without_losing_bytes() -> None:
         assert len(throttled.body) == 64 * 1024
         assert throttled.body[:1024] == baseline.body[:1024]
         assert throttled.body[-1024:] == baseline.body[-1024:]
+
+    asyncio.run(scenario())
+
+
+def _rate_limited(scope: str, *, extra_port: int = 0, bps: int = 64 * 1024 * 1024):
+    """把服务端配成"按 ``scope`` 限速"，可选地再加一个公网端口。
+
+    ``bps`` 取得很大：这一组验证的是**口径**（桶怎么分），不是限速是否生效——
+    限速本身另有专门用例，别让测试真的等带宽。
+    """
+
+    def configure(config: ServerConfig) -> None:
+        config.limits.per_client_download_bps = bps
+        config.limits.rate_limit_scope = scope
+        if extra_port:
+            config.mapping.append(
+                MappingRule(
+                    public_port=extra_port,
+                    local_port=config.mapping[0].local_port,
+                    host="127.0.0.1",
+                )
+            )
+
+    return configure
+
+
+def _client_id(harness: TunnelHarness) -> str:
+    assert harness.client is not None
+    return harness.client.client_id
+
+
+def _limiter(harness: TunnelHarness):
+    assert harness.server is not None
+    limiter = harness.server.limiter
+    assert limiter is not None, "该用例必须跑在有限速的配置下"
+    return limiter
+
+
+def test_default_scope_still_shares_one_bucket_across_ports() -> None:
+    """兼容性红线：不写 ``rate_limit_scope`` 时，同一客户端的两个公网端口仍**共用**一份额度。"""
+    extra = free_ports(1)[0]
+
+    async def scenario() -> None:
+        async with TunnelHarness(configure_server=_rate_limited("client", extra_port=extra)) as harness:
+            limiter = _limiter(harness)
+
+            assert (await http_request(harness.public_port, "/echo?msg=a")).status == 200
+            assert (await http_request(extra, "/echo?msg=b")).status == 200
+
+            await harness.wait_until(lambda: limiter.key_count >= 1, what="限速桶创建")
+            assert limiter.scope == "client"
+            assert limiter.active_keys() == [compose_limit_key("client", _client_id(harness))]
+
+    asyncio.run(scenario())
+
+
+def test_port_scope_gives_each_public_port_its_own_bucket() -> None:
+    """换成按端口口径后，桶按**端口**分，不按连接分：同端口再打一次不新增桶。"""
+    extra = free_ports(1)[0]
+
+    async def scenario() -> None:
+        async with TunnelHarness(configure_server=_rate_limited("port", extra_port=extra)) as harness:
+            limiter = _limiter(harness)
+            client_id = _client_id(harness)
+            expected = {
+                limiter.key_for(client_id, public_port=harness.public_port),
+                limiter.key_for(client_id, public_port=extra),
+            }
+
+            assert (await http_request(harness.public_port, "/echo?msg=a")).status == 200
+            assert (await http_request(extra, "/echo?msg=b")).status == 200
+
+            await harness.wait_until(lambda: limiter.key_count >= 2, what="两个端口的桶都建好")
+            assert set(limiter.active_keys()) == expected
+
+            assert (await http_request(harness.public_port, "/echo?msg=c")).status == 200
+            assert set(limiter.active_keys()) == expected
+
+    asyncio.run(scenario())
+
+
+def test_visitor_scope_keys_by_host_without_the_ephemeral_port() -> None:
+    """按访客分桶时 key 里必须**只有 IP**。
+
+    带上临时端口（``peer_name`` 的结果）就等于"一条连接一个桶"，限速会退化成只限单连接——
+    同一个 IP 的两次请求必须落进同一个桶才算对。
+    """
+
+    async def scenario() -> None:
+        async with TunnelHarness(configure_server=_rate_limited("visitor")) as harness:
+            limiter = _limiter(harness)
+            expected = limiter.key_for(_client_id(harness), visitor_host="127.0.0.1")
+
+            assert (await http_request(harness.public_port, "/echo?msg=a")).status == 200
+            assert (await http_request(harness.public_port, "/echo?msg=b")).status == 200
+
+            await harness.wait_until(lambda: limiter.key_count >= 1, what="访客维度的桶创建")
+            assert limiter.active_keys() == [expected]
+
+    asyncio.run(scenario())
+
+
+def test_limiter_buckets_are_released_when_the_client_goes_offline() -> None:
+    """口径不是"按客户端"时，桶的 key 不再等于 ``client_id``。
+
+    下线回收必须仍然一次清空该客户端的**全部**分片；只按单键释放就是一条内存泄漏路径
+    （桶随访客数 × 端口数无界增长）。
+    """
+    extra = free_ports(1)[0]
+
+    async def scenario() -> None:
+        async with TunnelHarness(configure_server=_rate_limited("port", extra_port=extra)) as harness:
+            limiter = _limiter(harness)
+
+            await http_request(harness.public_port, "/echo?msg=a")
+            await http_request(extra, "/echo?msg=b")
+            await harness.wait_until(lambda: limiter.key_count >= 2, what="两个桶都在")
+
+            await harness.stop_client()
+            await harness.wait_offline()
+
+            await harness.wait_until(lambda: limiter.key_count == 0, timeout=10.0, what="下线后分片桶被回收")
+            assert limiter.active_keys() == []
+
+    asyncio.run(scenario())
+
+
+def test_snapshot_exposes_per_port_bandwidth_and_throttling() -> None:
+    """带宽统计要落到**端口**这一维：哪个端口在吃流量、哪个端口在吃限速。"""
+
+    def configure(config: ServerConfig) -> None:
+        config.limits.per_client_download_bps = 64 * 1024
+
+    async def scenario() -> None:
+        async with TunnelHarness(configure_server=configure) as harness:
+            assert harness.server is not None
+            response = await http_request(harness.public_port, "/big?kb=32", timeout=30.0)
+            assert response.status == 200
+
+            # 统计在转发**收尾**时落账，而访客读到 EOF 可能更早 → 先轮询到账，再断言精确值
+            def accounted() -> bool:
+                entry = harness.server.snapshot()["bandwidth"].get(harness.public_port)  # type: ignore[union-attr]
+                return bool(entry) and entry["download"] > 0
+
+            await harness.wait_until(accounted, timeout=10.0, what="按端口的统计落账")
+
+            entry = harness.server.snapshot()["bandwidth"][harness.public_port]
+            assert entry["requests"] == 1
+            assert entry["download"] >= 32 * 1024
+            assert entry["throttled"] > 0.2, "这个端口确实被限速过"
+            # 只有一个端口时，按端口的合计必须与全局合计一致——不能各算各的
+            stats = harness.server.snapshot()["stats"]
+            assert entry["total"] == stats["bytes_upload"] + stats["bytes_download"]
+
+    asyncio.run(scenario())
+
+
+def test_snapshot_exposes_rate_limit_scope_and_bucket_watermark() -> None:
+    """限速口径是"会改掉老字段含义"的那类开关，必须在状态里读得出来。"""
+
+    async def scenario() -> None:
+        async with TunnelHarness(configure_server=_rate_limited("visitor", bps=1024)) as harness:
+            assert harness.server is not None and harness.server_config is not None
+            block = harness.server.snapshot()["rate_limit"]
+            assert block["scope"] == "visitor"
+            assert block["upload_bps"] == 0 and block["download_bps"] == 1024
+            assert block["max_keys"] == harness.server_config.limits.rate_limit_max_keys
+            assert block["keys"] == 0 and block["evicted"] == 0
+
+            assert (await http_request(harness.public_port, "/echo?msg=a")).status == 200
+            await harness.wait_until(
+                lambda: harness.server.snapshot()["rate_limit"]["keys"] >= 1,  # type: ignore[union-attr]
+                what="桶表水位更新",
+            )
+            assert harness.server.snapshot()["rate_limit"]["evicted"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_snapshot_still_reports_scope_when_bandwidth_limiting_is_off() -> None:
+    """两个方向都是 0 = 不限速，此时连限速器都不建；但"配了什么口径"仍要报出来。
+
+    否则"写了 ``rate_limit_scope: visitor`` 却忘了给 bps"这种配置在界面上完全不可见。
+    """
+
+    def configure(config: ServerConfig) -> None:
+        config.limits.rate_limit_scope = "visitor"
+
+    async def scenario() -> None:
+        async with TunnelHarness(configure_server=configure) as harness:
+            assert harness.server is not None
+            assert harness.server.limiter is None
+
+            block = harness.server.snapshot()["rate_limit"]
+            assert block["scope"] == "visitor"
+            assert block["keys"] == 0 and block["evicted"] == 0
 
     asyncio.run(scenario())
 

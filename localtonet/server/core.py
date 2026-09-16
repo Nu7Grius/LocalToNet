@@ -43,7 +43,7 @@ from localtonet.core.heartbeat import Watchdog
 from localtonet.core.limiter import ClientRateLimiter
 from localtonet.core.pipe import close_write_side, close_writer, pipe_both
 from localtonet.core.rules import parse_mapping, parse_ports
-from localtonet.core.runtime import cancel_all, peer_name, spawn
+from localtonet.core.runtime import cancel_all, peer_host, peer_name, spawn
 from localtonet.core.tls import (
     build_server_context,
     build_visitor_context,
@@ -78,6 +78,40 @@ _HTTP_PHRASES = {
 
 
 @dataclass
+class PortTraffic:
+    """按**公网端口**累计的转发量。``snapshot()["bandwidth"]`` 的数据源。
+
+    与 :class:`ServerStats` 的全局计数同语义：启动至今累计、不清零。
+    条目只在真的转发过流量时创建；映射表里删掉某个端口后旧条目仍在（当作历史），
+    所以条目数由"进程生命周期内映射过多少个端口"决定，**不受访客数量影响**
+    （访客维度的读取在 ``snapshot()["rate_limit"]["keys"]``，那个是有上限的）。
+    """
+
+    requests: int = 0
+    """已派发给客户端的请求数。口径与 ``REQUEST_START`` 事件一致：
+    被 429/502 挡在配对之前的请求不计入——那些压根没有流量。"""
+    upload: int = 0
+    """访客 → 隧道 → 内网后端 的字节数。"""
+    download: int = 0
+    """内网后端 → 隧道 → 访客 的字节数。"""
+    throttled: float = 0.0
+    """这个端口上因限速累计等待的秒数。"""
+
+    @property
+    def total(self) -> int:
+        return self.upload + self.download
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "requests": self.requests,
+            "upload": self.upload,
+            "download": self.download,
+            "total": self.total,
+            "throttled": round(self.throttled, 4),
+        }
+
+
+@dataclass
 class ServerStats:
     """服务端累计计数。启动至今不清零，给日志与未来的指标接口用。
 
@@ -86,6 +120,10 @@ class ServerStats:
     前者是"压根没开始转发"（配额拒绝），后者是"转了但失败了"。
     ``mapping_rejected`` 只统计**因身份无写权限**被拒的 ``set_mapping``——
     mapping 内容非法属于调用方 bug，不记在这里，免得安全事件淹没在噪声里。
+
+    ``by_port`` 是"按端口"那一维，**刻意不进** :meth:`to_dict`：
+    ``stats`` 是给状态栏读的一层扁平标量表（界面按名字逐个取值），
+    嵌一张表进去会把两种读取方式混在一起；它由 ``snapshot()["bandwidth"]`` 单独暴露。
     """
 
     clients_registered: int = 0
@@ -99,6 +137,8 @@ class ServerStats:
     bytes_download: int = 0
     throttled_seconds: float = 0.0
     """因带宽限速累计等待的秒数，用来回答"限速到底有没有在起作用"。"""
+    by_port: Dict[int, PortTraffic] = field(default_factory=dict)
+    """按公网端口分开的转发量，见 :class:`PortTraffic`。"""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -113,6 +153,27 @@ class ServerStats:
             "bytes_download": self.bytes_download,
             "throttled_seconds": round(self.throttled_seconds, 4),
         }
+
+    # ------------------------------------------------------------------ #
+
+    def note_request(self, public_port: int) -> None:
+        """记一次"请求已派发出去"。"""
+        self._port(public_port).requests += 1
+
+    def add_traffic(self, public_port: int, *, upload: int, download: int, throttled: float) -> None:
+        """记一次转发结束时的字节量与限速等待。"""
+        entry = self._port(public_port)
+        entry.upload += upload
+        entry.download += download
+        entry.throttled += throttled
+
+    def _port(self, public_port: int) -> PortTraffic:
+        """取（必要时创建）某个端口的计数条目。临界区内不含 await。"""
+        entry = self.by_port.get(public_port)
+        if entry is None:
+            entry = PortTraffic()
+            self.by_port[public_port] = entry
+        return entry
 
 
 class TunnelServer:
@@ -305,6 +366,31 @@ class TunnelServer:
             "listening": self._mapping.listen_ports(),
             "pending": len(self._pending),
             "stats": self._stats.to_dict(),
+            "bandwidth": self._bandwidth_snapshot(),
+            "rate_limit": self._rate_limit_snapshot(),
+        }
+
+    def _bandwidth_snapshot(self) -> Dict[int, Dict[str, Any]]:
+        """按公网端口分开的转发量。键是端口号（与 ``port_owner`` 同风格）。"""
+        return {port: traffic.to_dict() for port, traffic in sorted(self._stats.by_port.items())}
+
+    def _rate_limit_snapshot(self) -> Dict[str, Any]:
+        """限速的**当前口径**与桶表水位。
+
+        口径必须看得见：``scope`` 一旦不是 ``client``，``per_client_*_bps`` 的含义就从
+        "客户端总额度"变成了"每个汇总单位各自的额度"——这是配置语义被改掉的那一类开关，
+        跟 ``auth.shared_can_manage_mapping`` 一样，收紧/放宽都要在状态里读得出来。
+        ``keys``/``evicted`` 则回答"按访客分桶之后到底涨了多少、有没有撞上限"。
+        """
+        limiter = self._limiter
+        limits = self._config.limits
+        return {
+            "scope": limits.rate_limit_scope,
+            "upload_bps": limits.per_client_upload_bps,
+            "download_bps": limits.per_client_download_bps,
+            "max_keys": limits.rate_limit_max_keys,
+            "keys": limiter.key_count if limiter is not None else 0,
+            "evicted": limiter.evicted if limiter is not None else 0,
         }
 
     async def submit_mapping(self, rules: Sequence[MappingRule]) -> MappingDiff:
@@ -637,8 +723,10 @@ class TunnelServer:
 
         self._sync_online()
         if self._limiter is not None:
-            # 释放该客户端的限速桶，否则客户端增删会慢慢把内存吃满
-            self._limiter.forget(client_id)
+            # 释放该客户端的限速桶（含按端口/按访客的分片），否则客户端增删会慢慢把内存吃满。
+            # 必须用 forget_client 而不是 forget(client_id)：口径一变，桶的 key 就不再等于
+            # client_id，单键释放会一条都匹配不上（桶随访客数 × 端口数无界增长）。
+            self._limiter.forget_client(client_id)
         self._pending.fail_all_for_client(client_id, "客户端已离线")
         await close_writer(removed.writer)
         self._log.info("客户端 %s 已下线（%s），端口 %s 归属已释放", client_id, reason, sorted(removed.local_ports))
@@ -795,6 +883,8 @@ class TunnelServer:
     ) -> None:
         """一次访客请求的完整生命周期。"""
         peer = peer_name(writer)
+        # 只取 IP、不带端口：按访客口径分桶时带上临时端口就等于"每条连接一个桶"
+        visitor_host = peer_host(writer)
         conn_id = uuid.uuid4().hex
         pending: Optional[PendingConn] = None
         started = time.monotonic()
@@ -840,6 +930,7 @@ class TunnelServer:
             )
             self._pending.create(pending)
             self._stats.requests_total += 1
+            self._stats.note_request(public_port)
             self._log.debug(
                 "访客 %s 请求 %d -> %d，派给客户端 %s，conn=%s",
                 peer,
@@ -891,13 +982,24 @@ class TunnelServer:
                 pending.data_writer,
                 label=f"conn={conn_id}",
                 logger=self._log,
-                # 限速按 client_id 汇总：一个客户端开多条连接也绕不开自己的总配额
+                # 汇总单位由 limits.rate_limit_scope 决定：默认按 client_id 汇总，
+                # 一个客户端开多条连接也绕不开自己的总配额；按端口/按访客则各自一份额度
                 rate_limit=self._limiter,
-                limit_key=session.client_id,
+                limit_key=self._limit_key(
+                    session.client_id,
+                    public_port=public_port,
+                    visitor_host=visitor_host,
+                ),
             )
             self._stats.bytes_upload += stats.upload
             self._stats.bytes_download += stats.download
             self._stats.throttled_seconds += stats.throttled
+            self._stats.add_traffic(
+                public_port,
+                upload=stats.upload,
+                download=stats.download,
+                throttled=stats.throttled,
+            )
 
         except asyncio.CancelledError:
             raise
@@ -943,12 +1045,26 @@ class TunnelServer:
 
         两个方向都不限速时返回 ``None``，让 ``pipe_both`` 走无钩子的原路径——
         默认配置下这条链路的开销必须是零。
+
+        ``scope`` 在这里定格：口径决定 key 怎么编，中途换口径只会让新旧两种 key
+        同时存在（旧桶要等客户端下线才回收），而配置本来就是启动时读一次的。
         """
         limiter = ClientRateLimiter(
             upload_bps=limits.per_client_upload_bps,
             download_bps=limits.per_client_download_bps,
+            scope=limits.rate_limit_scope,
+            max_keys=limits.rate_limit_max_keys,
         )
         return limiter if limiter.enabled else None
+
+    def _limit_key(self, client_id: str, *, public_port: int, visitor_host: str) -> str:
+        """按 ``limits.rate_limit_scope`` 编出本次转发的限速汇总 key。
+
+        不限速时返回 ``client_id``（该值不参与任何计算，只是保持原样便于排查）。
+        """
+        if self._limiter is None:
+            return client_id
+        return self._limiter.key_for(client_id, public_port=public_port, visitor_host=visitor_host)
 
     def _sync_online(self) -> None:
         """把"当前在线客户端数"这个 gauge 同步进统计。"""

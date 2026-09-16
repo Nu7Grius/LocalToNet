@@ -7,6 +7,7 @@ localtonet.core.runtime —— 运行期小工具
   "Task exception was never retrieved" 警告，排查时非常痛苦。
 * ``cancel_all``：批量取消并等待，用于关停时收拾干净。
 * ``peer_name``：把 ``peername`` 格式化成日志友好的 ``ip:port``。
+* ``peer_host``：只取对端 **IP**，给"按访客 IP 分桶"这类用例用。
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from typing import Awaitable, Optional, Set, Tuple
 
 from logging_setup import get_logger
 
-__all__ = ["spawn", "cancel_all", "peer_name"]
+__all__ = ["spawn", "cancel_all", "peer_name", "peer_host"]
 
 T = asyncio.Task
 
@@ -73,6 +74,24 @@ def peer_name(writer: asyncio.StreamWriter) -> str:
     if isinstance(info, tuple) and len(info) >= 2:
         host, port = info[0], info[1]
         return f"{host}:{port}"
+    if info:
+        return str(info)
+    return "unknown"
+
+
+def peer_host(writer: asyncio.StreamWriter) -> str:
+    """取对端 **IP**（不含端口）；拿不到时返回 ``unknown``。
+
+    为什么单独给一个"不带端口"的函数：按访客 IP 分桶时限速 key 里**必须**只有 IP。
+    用 ``peer_name`` 的结果去分桶，等于每条访客连接都带一个不同的临时端口，
+    桶会变成"一条连接一个"——限速看着生效，实则只限住了单条连接。
+
+    TLS 下这里拿到的**仍然是 TCP 对端**（访客侧 TLS 在服务端终止，不引入代理层级），
+    所以有无 TLS 的分桶口径一致。
+    """
+    info: object = writer.get_extra_info("peername")
+    if isinstance(info, tuple) and len(info) >= 1:
+        return str(info[0])
     if info:
         return str(info)
     return "unknown"

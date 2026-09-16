@@ -20,6 +20,11 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+from localtonet.core.limiter import (
+    DEFAULT_MAX_KEYS,
+    RATE_LIMIT_SCOPE_CLIENT,
+    RATE_LIMIT_SCOPES,
+)
 from localtonet.errors import TunnelError
 
 __all__ = [
@@ -332,7 +337,10 @@ class LimitsConfig:
 
     两类语义必须分开看：
 
-    * ``max_*`` —— **容量**，必须为正；撞上它意味着"服务端该扩容了"（``503``）。
+    * ``max_*`` —— **容量**，必须为正；撞上它意味着"服务端该扩容/该收紧了"。
+      其中 ``max_msg_len`` / ``max_clients`` / ``max_mappings`` 是真拒绝（``503``/``400``），
+      而 ``rate_limit_max_keys`` 撞上只**淘汰**最久未用的限速桶，不拒绝任何请求
+      （限速的后果最坏也只是"某个汇总单位重新拿到一个满桶"）。
     * ``*_per_client`` / ``per_client_*`` —— **单客户端配额**，``0`` 表示不限；
       撞上它意味着"某个客户端该收敛了"（``429``）。
     """
@@ -343,20 +351,44 @@ class LimitsConfig:
     max_conns_per_client: int = 0
     """单个客户端同时进行中的访客转发数上限。0 表示不限。"""
     per_client_upload_bps: int = 0
-    """单个客户端的上行带宽上限（字节/秒）。0 表示不限。"""
+    """带宽额度的**数值**（字节/秒），含义由 :attr:`rate_limit_scope` 决定。0 表示不限。"""
     per_client_download_bps: int = 0
-    """单个客户端的下行带宽上限（字节/秒）。0 表示不限。"""
+    """同上，下行方向。"""
+    rate_limit_scope: str = RATE_LIMIT_SCOPE_CLIENT
+    """带宽限速的**汇总口径**：``client``（默认）/ ``port`` / ``visitor``。
 
-    _CAPACITY_FIELDS = ("max_msg_len", "max_clients", "max_mappings")
+    默认 ``client`` 是历史行为：一个客户端的所有端口、所有访客共用
+    ``per_client_*_bps`` 一份额度。换成 ``port`` 或 ``visitor`` 后，同样那两个数值
+    的含义就从"该客户端总额度"变成"每个汇总单位各自的额度"——**同一份老配置的行为会变**
+    （总带宽上限被放大成"单位数 × 额度"）。
+
+    正因为语义这么敏感，它单独开一个字段而不是改老字段的含义：
+    不写这个键的配置行为一字不变，升级不会悄悄放开带宽。"""
+    rate_limit_max_keys: int = DEFAULT_MAX_KEYS
+    """限速桶表的条目数上限（**全局**，不是每客户端）。
+
+    桶按"客户端 × 汇总单位"懒创建：按访客口径时条目数由访客 IP 的个数决定，
+    没有上限就是一条内存泄漏路径。超上限时淘汰最久未用的那条。"""
+
+    _CAPACITY_FIELDS = ("max_msg_len", "max_clients", "max_mappings", "rate_limit_max_keys")
     _QUOTA_FIELDS = ("max_conns_per_client", "per_client_upload_bps", "per_client_download_bps")
-    _FIELDS = _CAPACITY_FIELDS + _QUOTA_FIELDS
+    _FIELDS = _CAPACITY_FIELDS + _QUOTA_FIELDS + ("rate_limit_scope",)
 
     @classmethod
     def from_dict(cls, data: Optional[Mapping[str, Any]]) -> "LimitsConfig":
         if data is None:
             return cls()
         _check_unknown(data, cls._FIELDS, "limits")
-        return cls(**{k: _as_int(v, f"limits.{k}") for k, v in data.items()})
+        # 全是整数、只有一个字符串字段：逐个判类型，别再加一张"字段→解析器"的表
+        values: Dict[str, Any] = {
+            key: (
+                _as_str(raw, "limits.rate_limit_scope")
+                if key == "rate_limit_scope"
+                else _as_int(raw, f"limits.{key}")
+            )
+            for key, raw in data.items()
+        }
+        return cls(**values)
 
     def validate(self) -> None:
         for name in self._CAPACITY_FIELDS:
@@ -365,6 +397,10 @@ class LimitsConfig:
         for name in self._QUOTA_FIELDS:
             if getattr(self, name) < 0:
                 raise ConfigError(f"limits.{name} 不能为负数（0 表示不限）")
+        if self.rate_limit_scope not in RATE_LIMIT_SCOPES:
+            raise ConfigError(
+                f"limits.rate_limit_scope 必须是 {list(RATE_LIMIT_SCOPES)} 之一，实际为 {self.rate_limit_scope!r}"
+            )
 
 
 @dataclass

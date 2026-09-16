@@ -24,6 +24,12 @@ from config import (
     ServerTlsConfig,
     Timeouts,
 )
+from localtonet.core.limiter import (
+    DEFAULT_MAX_KEYS,
+    RATE_LIMIT_SCOPES,
+    ClientRateLimiter,
+    compose_limit_key,
+)
 from localtonet.errors import TunnelError
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -365,7 +371,7 @@ def test_quota_field_accepts_zero_but_rejects_negative(field: str) -> None:
         LimitsConfig(**{field: -1}).validate()
 
 
-@pytest.mark.parametrize("field", ("max_msg_len", "max_clients", "max_mappings"))
+@pytest.mark.parametrize("field", ("max_msg_len", "max_clients", "max_mappings", "rate_limit_max_keys"))
 def test_capacity_field_rejects_zero(field: str) -> None:
     """容量字段与配额字段语义不同：容量为 0 等于"什么都收不了"，必须报错。"""
     with pytest.raises(ConfigError, match="必须为正数"):
@@ -390,6 +396,68 @@ def test_limits_block_is_loaded_from_server_config() -> None:
 
     assert cfg.limits.max_conns_per_client == 8
     assert cfg.limits.per_client_upload_bps == 4096
+
+
+# --------------------------------------------------------------------------- #
+# limits：限速汇总口径（六期）
+# --------------------------------------------------------------------------- #
+
+
+def test_rate_limit_scope_defaults_to_client_scope() -> None:
+    """兼容性红线：不写这个键就是历史行为（按客户端一份总额度）。
+
+    默认值翻成 ``port``/``visitor`` 会让升级后的部署在同一份配置下把总带宽上限
+    放大成"端口数/访客数 × 额度"——绝不能让升级自己改行为。
+    """
+    limits = LimitsConfig()
+    assert limits.rate_limit_scope == "client"
+    limits.validate()
+    # 端口/访客分桶必须显式配置
+    assert LimitsConfig.from_dict({"rate_limit_scope": "port"}).rate_limit_scope == "port"
+
+
+def test_rate_limit_scope_rejects_unknown_value() -> None:
+    with pytest.raises(ConfigError, match="rate_limit_scope"):
+        LimitsConfig.from_dict({"rate_limit_scope": "sideways"}).validate()
+
+
+def test_rate_limit_scope_must_be_str() -> None:
+    with pytest.raises(ConfigError, match="limits.rate_limit_scope 必须是字符串"):
+        LimitsConfig.from_dict({"rate_limit_scope": 1})
+
+
+def test_rate_limit_max_keys_is_a_capacity_and_must_be_positive() -> None:
+    with pytest.raises(ConfigError, match="limits.rate_limit_max_keys 必须为正数"):
+        LimitsConfig.from_dict({"rate_limit_max_keys": 0}).validate()
+
+
+def test_every_advertised_scope_is_accepted_by_the_limiter() -> None:
+    """抗分歧钉子：配置侧的可选值表与限速器实现必须一一对应。
+
+    校验用的是 ``RATE_LIMIT_SCOPES``，key 怎么编在 ``ClientRateLimiter`` 里；
+    两边哪天只剩一边被改动（比如新增一种口径却忘了实现），这条用例先红。
+    """
+    for scope in RATE_LIMIT_SCOPES:
+        limits = LimitsConfig(rate_limit_scope=scope)
+        limits.validate()
+        limiter = ClientRateLimiter(upload_bps=1024, scope=scope)
+        assert limiter.scope == scope
+        # 该口径能否编出 key（缺分片参数时必须炸，说明它真的按那个口径在编）
+        if scope == "client":
+            assert limiter.key_for("client-a") == compose_limit_key(scope, "client-a")
+        elif scope == "port":
+            assert limiter.key_for("client-a", public_port=80) == compose_limit_key(
+                scope, "client-a", public_port=80
+            )
+        else:
+            assert limiter.key_for("client-a", visitor_host="203.0.113.7") == compose_limit_key(
+                scope, "client-a", visitor_host="203.0.113.7"
+            )
+
+
+def test_limits_max_keys_default_matches_the_limiter_default() -> None:
+    """同一个默认值只允许有一处定义（``limiter.DEFAULT_MAX_KEYS``）。"""
+    assert LimitsConfig().rate_limit_max_keys == DEFAULT_MAX_KEYS
 
 
 # --------------------------------------------------------------------------- #

@@ -187,6 +187,42 @@ def test_status_line_shows_throttle_when_used() -> None:
     assert "限速等待 1.2秒" in state.status_line()
 
 
+def test_status_line_hides_the_default_rate_limit_scope() -> None:
+    """默认口径天天写在状态栏上是噪声——只在"从默认改开去"时才提醒。"""
+    state = adopt_server_snapshot(ServerState(), _snapshot(rate_limit={"scope": "client", "evicted": 0}))
+    assert state.rate_limit_scope == "client"
+    assert "限速口径" not in state.status_line()
+
+
+def test_status_line_shows_the_non_default_rate_limit_scope() -> None:
+    """换成按端口/按访客后，per_client_*_bps 的含义被改了，必须写在脸上。"""
+    state = adopt_server_snapshot(ServerState(), _snapshot(rate_limit={"scope": "visitor", "evicted": 0}))
+    assert "限速口径 按访客IP" in state.status_line()
+
+    by_port = adopt_server_snapshot(ServerState(), _snapshot(rate_limit={"scope": "port", "evicted": 0}))
+    assert "限速口径 按端口" in by_port.status_line()
+
+
+def test_status_line_reports_evicted_buckets() -> None:
+    """桶表开始淘汰说明上限该调大了——这是"按访客分桶"最可能踩到的坑。"""
+    state = adopt_server_snapshot(ServerState(), _snapshot(rate_limit={"scope": "visitor", "evicted": 7}))
+    assert state.rate_limit_evicted == 7
+    assert "限速桶表淘汰 7" in state.status_line()
+
+
+def test_rate_limit_block_tolerates_missing_and_malformed_snapshot() -> None:
+    """老服务端没有这一块、或字段类型不对时，一律退回默认口径，不许抛异常。"""
+    for snapshot in (
+        _snapshot(),  # 压根没有 rate_limit 键（老服务端）
+        _snapshot(rate_limit="nonsense"),
+        _snapshot(rate_limit={"scope": 1, "evicted": "x"}),
+    ):
+        state = adopt_server_snapshot(ServerState(), snapshot)
+        assert state.rate_limit_scope == "client"
+        assert state.rate_limit_evicted == 0
+        assert "限速口径" not in state.status_line()
+
+
 # --------------------------------------------------------------------------- #
 # 事件 → 状态
 # --------------------------------------------------------------------------- #

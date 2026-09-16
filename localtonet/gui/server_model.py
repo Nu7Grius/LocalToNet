@@ -45,6 +45,14 @@ __all__ = [
 ANONYMOUS_IDENTITY = "anonymous"
 """不配鉴权时服务端给的身份标签（与 ``server.auth.ANONYMOUS`` 同名，界面只做展示）。"""
 
+RATE_LIMIT_SCOPE_LABELS: Dict[str, str] = {
+    "client": "按客户端",
+    "port": "按端口",
+    "visitor": "按访客IP",
+}
+"""限速汇总口径的中文标签。只在**非默认口径**时才写进状态栏——
+默认值天天显示是噪声，而"从默认改开去"的那一刻恰恰是运维唯一需要被提醒的时刻。"""
+
 
 # --------------------------------------------------------------------------- #
 # 在线客户端：表格行
@@ -185,6 +193,24 @@ class ServerState:
             return 0.0
         return _as_float(stats.get("throttled_seconds"))
 
+    @property
+    def rate_limit_scope(self) -> str:
+        """限速汇总口径。老服务端/老快照没有这一块时按默认口径 ``client`` 处理。"""
+        block = self.snapshot.get("rate_limit")
+        if not isinstance(block, Mapping):
+            return "client"
+        scope = block.get("scope")
+        return scope if isinstance(scope, str) and scope else "client"
+
+    @property
+    def rate_limit_evicted(self) -> int:
+        """被桶表上限淘汰掉的 key 数。非 0 说明 ``limits.rate_limit_max_keys`` 该调大。"""
+        block = self.snapshot.get("rate_limit")
+        if not isinstance(block, Mapping):
+            return 0
+        value = block.get("evicted")
+        return value if isinstance(value, int) else 0
+
     def status_line(self) -> str:
         """状态栏文本。按"运维先想知道什么"排序，计数放后面。"""
         parts = [
@@ -198,8 +224,16 @@ class ServerState:
             f"（失败 {self.stat('requests_failed')} / 拒绝 {self.stat('requests_rejected')}）",
             f"上行 {fmt_bytes(self.stat('bytes_upload'))} / 下行 {fmt_bytes(self.stat('bytes_download'))}",
         ]
+        scope = self.rate_limit_scope
+        if scope != "client":
+            # 换成非默认口径后，per_client_*_bps 的含义就从"客户端总额度"变成了
+            # "每个汇总单位各自的额度"——总带宽上限被放大了，必须写在脸上
+            parts.append(f"限速口径 {RATE_LIMIT_SCOPE_LABELS.get(scope, scope)}")
         if self.throttled_seconds:
             parts.append(f"限速等待 {self.throttled_seconds:.1f}秒")
+        evicted = self.rate_limit_evicted
+        if evicted:
+            parts.append(f"限速桶表淘汰 {evicted}")
         return " ｜ ".join(parts)
 
 
