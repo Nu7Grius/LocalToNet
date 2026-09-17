@@ -34,3 +34,8 @@ Thumbs.db
 
 # WorkBuddy 本地工作数据（不入库）
 .workbuddy/
+
+# 生产配置与凭据（含令牌，绝不入库）
+client.prod.json
+tokens.json
+*.token
