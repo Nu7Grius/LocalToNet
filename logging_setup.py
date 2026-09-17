@@ -13,6 +13,7 @@ logging_setup.py —— 统一日志配置
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from typing import IO, Optional
 
@@ -45,6 +46,11 @@ def setup_logging(
     logger.addHandler(console)
 
     if log_file:
+        # FileHandler 不会创建父目录；父目录缺失会直接抛 FileNotFoundError。
+        # 无控制台运行（pythonw / systemd）时那就是"静默死亡"，这里先补上目录。
+        directory = os.path.dirname(os.path.abspath(log_file))
+        if directory:
+            os.makedirs(directory, exist_ok=True)
         file_handler = logging.FileHandler(log_file, encoding="utf-8")
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
