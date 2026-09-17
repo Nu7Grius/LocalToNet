@@ -699,7 +699,7 @@ LocalToNet/
 │       ├── app.py            客户端窗口
 │       └── server_app.py     管理台窗口（在线客户端表 + 映射表）
 ├── examples/demo_backend.py  演示用内网 HTTP 服务
-└── tests/                    406 项测试（单测 + 端到端 + 双端 GUI + 命令行 + 鉴权 + TLS + 访客端 TLS）
+└── tests/                    456 项测试（单测 + 端到端 + 双端 GUI + 命令行 + 鉴权 + TLS + 访客端 TLS）
 ```
 
 ## 协议
@@ -935,10 +935,10 @@ python -m pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-当前 **452 项全部通过**（test_config 84 / test_auth_tokens 54 / test_gui_model 50 /
+当前 **456 项全部通过**（test_config 84 / test_auth_tokens 54 / test_gui_model 50 /
 test_gui_server_model 43 / test_core 40 / test_e2e 31 / test_server_cli 29 / test_limiter 23 /
 test_mapping_store 21 / test_protocol 17 / test_gui_server_controller 14 / test_visitor_tls 13 /
-test_tls 10 / test_gui_bridge 10 / test_client_cli 7 / test_gui_controller 6），
+test_tls 10 / test_gui_bridge 10 / test_client_cli 7 / test_gui_controller 6 / test_logging_setup 4），
 其中 31 项是真实拉起三件套、走真实 TCP 的端到端测试：
 
 | 用例 | 验证内容 |

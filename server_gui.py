@@ -18,12 +18,16 @@ server_gui.py —— 服务端管理台入口（公网侧）
 三条边界要先说清楚：
 
 1. **不新增协议、不做远程管理**。管理台就贴在服务端进程里，直接读
-   :meth:`TunnelServer.snapshot`、直接调 :meth:`TunnelServer.submit_mapping`。
+   :meth:`TunnelServer.snapshot`、直接调 :meth:`TunnelServer.submit_mapping`
+   与 :meth:`TunnelServer.kick_client`。
    "服务端继续跑、窗口在另一台机器上开"是远程管理，需要协议扩展与权限模型，
    不在本轮范围。
 2. **关掉窗口 = 服务端下线**（访客端口全部关闭）。要长时间托管请用 ``server.py``。
-3. **在线客户端表是只读的**：本轮不做"踢人"——没有权限模型的情况下，
-   一个误点的按钮就能掐断正在服务的隧道。
+3. **在线客户端表只有一个写操作：踢出选中客户端**。它的门槛不是"权限模型"——
+   能打开这个窗口的人本来就能停服务端、改全局映射表，权限边界就是"本机同进程"
+   这件事本身；它要防的是**误点**：确认框会把身份、对端、认领端口与后果列全。
+   判定与执行都在服务端（``TunnelServer.kick_client`` → ``_disconnect_session``），
+   窗口只负责确认与投递。
 """
 
 from __future__ import annotations
