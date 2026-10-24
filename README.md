@@ -723,6 +723,13 @@ LocalToNet/
 │       ├── app.py            客户端窗口
 │       └── server_app.py     管理台窗口（在线客户端表 + 映射表）
 ├── examples/demo_backend.py  演示用内网 HTTP 服务
+├── packaging/                打包层（构建期文件，运行时不参与）
+│   ├── make_icon.py          纯标准库生成 assets/icon.ico（手写 ICO 容器）
+│   ├── version_info.txt.in   VERSIONINFO 模板（{MAJOR}.{MINOR}.{PATCH} 占位）
+│   ├── build.sh              一键构建 4 个 one-file 产物（Git Bash 可执行）
+│   ├── pyinstaller/          四个 spec：server / client / server_gui / client_gui
+│   └── smoke/                GUI 冒烟自动化（PowerShell，按几何定位 tkinter 构件）
+├── assets/icon.ico           应用图标（四个 spec 共用；后续可人工替换）
 └── tests/                    456 项测试（单测 + 端到端 + 双端 GUI + 命令行 + 鉴权 + TLS + 访客端 TLS）
 ```
 
@@ -923,6 +930,60 @@ App ──root.after(100ms)──► drain()  ◄── queue ◄── EventBus
 （改映射只影响之后的新请求），所以配了完整的误点保护（先选中 + 列出身份/对端/端口与后果的
 确认框）与一段冷却期，细节见「管理台踢人」。判定与执行都在服务端
 （`TunnelServer.kick_client` → 下线内核 `_disconnect_session`），界面只负责确认与投递。
+
+## 免安装发行包（Windows）
+
+不想装 Python 的用户，直接下 `dist/` 里对应的 exe 双击即可。四个产物都是
+**单文件（one-file）**，运行时零第三方依赖（OpenSSL DLL 已由 PyInstaller 的 ssl hook
+自动打入），版本号统一读 `localtonet/__init__.py` 的 `__version__`：
+
+| 产物 | 入口 | 窗口 | 体积 | 用途 |
+| --- | --- | --- | --- | --- |
+| `LocalToNet-Server-<ver>.exe` | `server.py` | 控制台 | ~10 MB | 服务端，日志要可见 |
+| `LocalToNet-Client-<ver>.exe` | `client.py` | 控制台 | ~10 MB | 客户端，日志要可见 |
+| `LocalToNet-ServerGUI-<ver>.exe` | `server_gui.py` | 无控制台 | ~13 MB | 服务端管理台 |
+| `LocalToNet-ClientGUI-<ver>.exe` | `gui.py` | 无控制台 | ~13 MB | 客户端界面 |
+
+命令行参数与源码版完全一致（`--help` 可查），行为也一致——打包不改任何运行时逻辑。
+
+### 配置文件放哪：一切相对**启动时的工作目录**
+
+打包后 `__file__` 不存在，程序**不会**去 exe 所在目录找配置。所有相对路径都相对
+**启动那一刻的工作目录（cwd）**解析：
+
+```
+你的目录/
+├── LocalToNet-Server-0.1.0.exe   ← 双击启动（或在此目录开命令行再启动）
+├── config.json                   ← -c 指定的配置（可选）
+├── tokens.json                   ← --auth-file 指定的令牌表（可选）
+├── mappings.json                 ← mapping-store=file 时的映射表（运行时生成/更新）
+└── logs/                         ← 日志目录（运行时生成）
+```
+
+注意两点：
+
+- `sys._MEIPASS` 是 one-file 启动时的**临时解压目录**（`%TEMP%\_MEIxxxxxx`），
+  程序退出即删——**绝不**把配置文件、令牌表、映射表、日志放那里，重启就丢。
+- 拿不准就用**绝对路径**传参（`-c D:\conf\config.json`、`--auth-file D:\conf\tokens.json`），
+  一了百了。
+
+### 令牌鉴权
+
+`--auth-file tokens.json` 用法与源码版相同，格式见「开启鉴权 → 令牌表格式」。
+**别用仓库里的演示配置当生产模板**（`config.json` 的 `auth.enabled=false` 只是测试钉死的演示值）。
+错令牌注册会被拒（`403`），服务端日志与事件里可观测，客户端按退避重试。
+
+### 杀软误报说明
+
+PyInstaller 的 one-file 产物会被少数杀软误报（bootloader 要把自己解压到临时目录再运行，
+这个行为与某些加壳软件相似）。本项目**未做代码签名**（本轮范围不含），遇到误报请加白名单
+或改用源码运行。发行包只在 Windows x64 上构建验证；macOS / Linux 产物、NSIS 安装包、
+onedir 形态本轮都不做。
+
+### 自己构建
+
+完整复现步骤（解释器选型及原因、四个 spec 的逐项说明、hidden imports 为什么必须加、
+冒烟验收记录、故障排查表）见 [docs/packaging.md](docs/packaging.md)。
 
 ## 扩展点
 

@@ -1,0 +1,35 @@
+# version_info.txt.in —— Windows VERSIONINFO 模板（构建期由 packaging/build.sh 渲染）
+# 占位符 {MAJOR}/{MINOR}/{PATCH} 取自 localtonet/__init__.py 的 __version__——
+# 版本号唯一出处在运行时包内，发行产物不允许有第二份硬编码。
+# 语言 040904B0 = 美式英语(0409) + 代码页 04B0(UTF-16)。
+# 四个 exe 共用这一份渲染结果（版本号一致即可，不逐产物区分描述）。
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=({MAJOR}, {MINOR}, {PATCH}, 0),
+    prodvers=({MAJOR}, {MINOR}, {PATCH}, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          u'040904B0',
+          [StringStruct(u'CompanyName', u'LocalToNet'),
+           StringStruct(u'FileDescription', u'LocalToNet 内网穿透工具（单文件发行包）'),
+           StringStruct(u'FileVersion', u'{MAJOR}.{MINOR}.{PATCH}.0'),
+           StringStruct(u'InternalName', u'LocalToNet'),
+           StringStruct(u'LegalCopyright', u'MIT License'),
+           StringStruct(u'OriginalFilename', u'LocalToNet-{MAJOR}.{MINOR}.{PATCH}.exe'),
+           StringStruct(u'ProductName', u'LocalToNet'),
+           StringStruct(u'ProductVersion', u'{MAJOR}.{MINOR}.{PATCH}.0')]
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct(u'Translation', [0x0409, 0x04B0])])
+  ]
+)

@@ -1,3 +1,5 @@
-# 开发期依赖：运行时零依赖，仅测试需要 pytest
+# 开发期依赖：运行时零依赖，仅测试与构建需要
 #   python -m pip install -r requirements-dev.txt
 pytest>=8.0
+# PyInstaller：仅构建期使用（packaging/build.sh 打单文件发行包），运行时零依赖红线不动
+pyinstaller==6.22.3
